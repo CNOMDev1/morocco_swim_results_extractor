@@ -14,7 +14,7 @@ from typing import Any
 
 import google.generativeai as genai
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
 DAILY_LIMIT = 1_000_000
 DAILY_STOP_THRESHOLD = 950_000
 REQUEST_SLEEP_SECONDS = 4
@@ -120,6 +120,11 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Nombre max de fichiers a traiter (0 = tous).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Affiche les details de traitement (tentatives, retries, timings).",
+    )
     return parser.parse_args()
 
 
@@ -224,10 +229,30 @@ def parse_usage_tokens(response: Any) -> int:
     return total_tokens if total_tokens > 0 else (prompt_tokens + output_tokens)
 
 
-def generate_with_retries(model: genai.GenerativeModel, prompt: str) -> tuple[str, int]:
+def debug_print(enabled: bool, message: str) -> None:
+    if enabled:
+        print(f"[debug] {message}")
+
+
+def is_blocking_quota_error(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "quota exceeded" in lowered
+        and "limit: 0" in lowered
+        and "free_tier" in lowered
+    )
+
+
+def generate_with_retries(
+    model: genai.GenerativeModel,
+    prompt: str,
+    debug: bool,
+) -> tuple[str, int]:
     last_exception: Exception | None = None
     for attempt in range(1, NETWORK_MAX_RETRIES + 1):
         try:
+            started_at = time.perf_counter()
+            debug_print(debug, f"Gemini attempt {attempt}/{NETWORK_MAX_RETRIES} started")
             response = model.generate_content(
                 prompt,
                 generation_config={
@@ -235,22 +260,36 @@ def generate_with_retries(model: genai.GenerativeModel, prompt: str) -> tuple[st
                     "response_mime_type": "application/json",
                 },
             )
+            elapsed = time.perf_counter() - started_at
             response_text = getattr(response, "text", "") or ""
             used_tokens = parse_usage_tokens(response)
+            debug_print(
+                debug,
+                (
+                    f"Gemini attempt {attempt} success in {elapsed:.2f}s | "
+                    f"response_chars={len(response_text)} | used_tokens={used_tokens}"
+                ),
+            )
             return response_text, used_tokens
         except Exception as exc:
             last_exception = exc
             message = str(exc)
             transient_markers = ("429", "500", "502", "503", "504", "timeout", "connection")
             lower_message = message.lower()
+            debug_print(
+                debug,
+                f"Gemini attempt {attempt} failed: {type(exc).__name__}: {exc}",
+            )
 
             if "429" in message:
+                debug_print(debug, f"Rate limit detecte, attente {RATE_LIMIT_RETRY_SECONDS}s")
                 time.sleep(RATE_LIMIT_RETRY_SECONDS)
                 continue
 
             is_transient = any(marker in lower_message for marker in transient_markers)
             if is_transient and attempt < NETWORK_MAX_RETRIES:
                 backoff = NETWORK_BACKOFF_BASE_SECONDS ** attempt
+                debug_print(debug, f"Erreur transitoire, retry dans {backoff}s")
                 time.sleep(backoff)
                 continue
             raise RuntimeError(f"Gemini error (attempt {attempt}/{NETWORK_MAX_RETRIES}): {exc}") from exc
@@ -334,6 +373,7 @@ def process_one_file(
     output_dir: Path,
     errors_dir: Path,
     model: genai.GenerativeModel,
+    debug: bool,
 ) -> tuple[str, int]:
     source_raw = file_path.read_text(encoding="utf-8")
     source_payload: Any
@@ -345,9 +385,10 @@ def process_one_file(
     source_text = extract_text_from_source(source_payload)
     if not source_text.strip():
         return "Aucun texte exploitable (full_text/pages).", 0
+    debug_print(debug, f"{file_path.name}: texte extrait ({len(source_text)} caracteres)")
 
     prompt = build_user_prompt(source_text)
-    response_text, used_tokens = generate_with_retries(model, prompt)
+    response_text, used_tokens = generate_with_retries(model, prompt, debug=debug)
 
     try:
         parsed = json.loads(response_text)
@@ -364,6 +405,7 @@ def process_one_file(
         json.dumps(output_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    debug_print(debug, f"{file_path.name}: fichier structure sauvegarde -> {output_path}")
     return "OK", used_tokens
 
 
@@ -405,6 +447,13 @@ def main() -> int:
 
     print(f"[info] Fichiers detectes: {len(files)}")
     print(f"[info] Tokens utilises aujourd'hui: {tokens_used_today}/{DAILY_LIMIT}")
+    debug_print(
+        args.debug,
+        (
+            f"config model={args.model} stop_threshold={args.daily_stop_threshold} "
+            f"sleep={args.sleep_between_requests}s max_files={args.max_files or 'all'}"
+        ),
+    )
 
     for file_path in files:
         if file_path.name in processed_files:
@@ -426,6 +475,7 @@ def main() -> int:
                 output_dir=output_dir,
                 errors_dir=errors_dir,
                 model=model,
+                debug=args.debug,
             )
         except Exception as exc:
             status = f"ERREUR appel Gemini: {exc}"
@@ -442,6 +492,13 @@ def main() -> int:
         else:
             logger.error("%s | %s | tokens=%s", file_path.name, status, used_tokens)
             print(f"[echec] {file_path.name} | {status} | +{used_tokens} tokens")
+            if is_blocking_quota_error(status):
+                print(
+                    "[stop] Quota Gemini bloque (free tier limit=0). "
+                    "Arret automatique pour eviter des retries inutiles."
+                )
+                save_progress(progress_file, progress)
+                break
 
         save_progress(progress_file, progress)
         time.sleep(max(0.0, float(args.sleep_between_requests)))
