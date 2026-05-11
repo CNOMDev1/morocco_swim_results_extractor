@@ -9,6 +9,13 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_INPUT_DIRS = [
+    PROJECT_ROOT / "data" / "pdfs_results",
+    PROJECT_ROOT / "data" / "pdfs_results_actualites",
+]
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "json_from_pdfs"
+
 
 def extract_pdf_content(pdf_path: Path) -> dict:
     """Extrait le contenu texte page par page d'un PDF."""
@@ -50,6 +57,27 @@ def collect_pdf_files(input_dir: Path, recursive: bool) -> list[Path]:
     )
 
 
+def build_output_path(
+    pdf_path: Path,
+    input_dir: Path,
+    output_dir: Path,
+    preserve_structure: bool,
+) -> Path:
+    """Construit le chemin de sortie JSON pour un PDF.
+
+    Si ``preserve_structure`` est vrai, on reproduit la structure relative
+    du PDF (incluant le nom du dossier d'entrée) sous ``output_dir`` pour
+    éviter les collisions entre dossiers (ex: années identiques dans
+    ``pdfs_results_actualites``).
+    """
+    json_name = f"{pdf_path.stem}.json"
+    if not preserve_structure:
+        return output_dir / json_name
+
+    relative_pdf = pdf_path.relative_to(input_dir)
+    return output_dir / input_dir.name / relative_pdf.parent / json_name
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extraire le contenu de PDF et générer des fichiers JSON."
@@ -57,26 +85,45 @@ def main() -> int:
     parser.add_argument(
         "--input-dirs",
         nargs="+",
-        default=["data/pdfs_results", "data/pdfs_results_actualites"],
+        default=[str(path) for path in DEFAULT_INPUT_DIRS],
         help=(
             "Un ou plusieurs dossiers qui contiennent les PDF "
-            "(défaut: data/pdfs_results data/pdfs_results_actualites)."
+            "(défaut: <racine_projet>/data/pdfs_results "
+            "<racine_projet>/data/pdfs_results_actualites)."
         ),
     )
     parser.add_argument(
         "--output-dir",
-        default="data/json_from_pdfs",
-        help="Dossier de sortie pour les JSON (défaut: data/json_from_pdfs).",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help=(
+            "Dossier de sortie pour les JSON "
+            "(défaut: <racine_projet>/data/json_from_pdfs)."
+        ),
     )
     parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Parcourir les sous-dossiers du dossier d'entrée.",
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        help=(
+            "Ne pas parcourir les sous-dossiers (par défaut, le parcours "
+            "est récursif pour gérer pdfs_results_actualites/<année>/...)."
+        ),
     )
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help=(
+            "Écrire tous les JSON à plat dans --output-dir. "
+            "Par défaut on reproduit la structure des dossiers d'entrée "
+            "pour éviter les collisions de noms."
+        ),
+    )
+    parser.set_defaults(recursive=True)
     args = parser.parse_args()
 
     input_dirs = [Path(p) for p in args.input_dirs]
     output_dir = Path(args.output_dir)
+    preserve_structure = not args.flat_output
 
     existing_input_dirs = [d for d in input_dirs if d.exists() and d.is_dir()]
     missing_input_dirs = [d for d in input_dirs if d not in existing_input_dirs]
@@ -88,12 +135,17 @@ def main() -> int:
         print("[erreur] Aucun dossier d'entrée valide.")
         return 1
 
-    pdf_files: list[Path] = []
+    pdf_jobs: list[tuple[Path, Path]] = []
+    seen_pdfs: set[Path] = set()
     for input_dir in existing_input_dirs:
-        pdf_files.extend(collect_pdf_files(input_dir, args.recursive))
-    pdf_files = sorted(set(pdf_files))
+        for pdf_path in collect_pdf_files(input_dir, args.recursive):
+            resolved = pdf_path.resolve()
+            if resolved in seen_pdfs:
+                continue
+            seen_pdfs.add(resolved)
+            pdf_jobs.append((pdf_path, input_dir))
 
-    if not pdf_files:
+    if not pdf_jobs:
         joined_dirs = ", ".join(str(d) for d in existing_input_dirs)
         print(f"[info] Aucun PDF trouvé dans: {joined_dirs}")
         return 0
@@ -101,15 +153,16 @@ def main() -> int:
     success_count = 0
     error_count = 0
 
-    print(f"[info] {len(pdf_files)} PDF trouvé(s).")
-    for index, pdf_path in enumerate(pdf_files, start=1):
+    print(f"[info] {len(pdf_jobs)} PDF trouvé(s).")
+    for index, (pdf_path, input_dir) in enumerate(pdf_jobs, start=1):
         try:
             content = extract_pdf_content(pdf_path)
-            json_name = f"{pdf_path.stem}.json"
-            output_path = output_dir / json_name
+            output_path = build_output_path(
+                pdf_path, input_dir, output_dir, preserve_structure
+            )
             save_json(content, output_path)
             success_count += 1
-            print(f"[ok] ({index}/{len(pdf_files)}) {pdf_path.name} -> {output_path}")
+            print(f"[ok] ({index}/{len(pdf_jobs)}) {pdf_path.name} -> {output_path}")
         except Exception as exc:
             error_count += 1
             print(f"[échec] {pdf_path}: {exc}")
