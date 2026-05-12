@@ -36,22 +36,14 @@ DAILY_REQUEST_LIMIT     = 14_400
 DAILY_REQUEST_THRESHOLD = 14_000
 
 # ── Timing ────────────────────────────────────────────────────────────────────
-# Groq tier gratuit : 6 000 TPM (tokens par minute), fenêtre glissante de 60s.
-# On attend 62s entre CHAQUE requête (chunk) pour que le compteur TPM se vide.
-# C'est la seule façon fiable de ne jamais avoir de 413.
-INTER_REQUEST_SLEEP  = 62.0   # secondes entre chaque appel API
-RATE_LIMIT_SLEEP     = 65.0   # si on reçoit quand même un 429
+INTER_REQUEST_SLEEP  = 62.0
+RATE_LIMIT_SLEEP     = 65.0
 NETWORK_MAX_RETRIES  = 5
 NETWORK_BACKOFF_BASE = 2
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
-# Budget TPM : 6000 tok/min
-# - Prompt système   : ~300 tok
-# - Réponse estimée  : ~2000 tok
-# - Budget texte     : ~3700 tok → ~14 800 chars (1 tok ≈ 4 chars)
-# On prend 12 000 chars avec marge de sécurité.
 INITIAL_CHUNK_CHARS = 12_000
-MIN_CHUNK_CHARS     = 3_000   # seuil minimal si réduction adaptative
+MIN_CHUNK_CHARS     = 3_000
 
 # ── Catégories valides ────────────────────────────────────────────────────────
 VALID_CATEGORIES = {"BENJAMINS", "MINIMES", "CADETS", "JUNIORS", "SENIORS"}
@@ -317,7 +309,6 @@ def call_groq_chunk(
             return text_out, total_tok
 
         except RateLimitError as exc:
-            # 429 : limite RPM (requêtes/minute)
             retry_after = RATE_LIMIT_SLEEP
             resp = getattr(exc, "response", None)
             if resp is not None:
@@ -335,7 +326,6 @@ def call_groq_chunk(
             code = exc.status_code
 
             if code == 413:
-                # 413 : limite TPM (tokens/minute) → réduire le chunk
                 new_size = max(len(current_text) // 2, MIN_CHUNK_CHARS)
                 if new_size < len(current_text) and new_size >= MIN_CHUNK_CHARS:
                     print(f"  [413 TPM] {chunk_label} : {len(current_text)} chars trop grand "
@@ -419,7 +409,7 @@ def normalize_output(raw: Any, source_file: str) -> dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Traitement d'un fichier (peut générer plusieurs requêtes si chunking)
+# Traitement d'un fichier
 # ══════════════════════════════════════════════════════════════════════════════
 
 def process_file(
@@ -430,7 +420,7 @@ def process_file(
     model_name:   str,
     inter_sleep:  float,
     debug:        bool,
-    requests_today: int,        # passé par référence via retour
+    requests_today: int,
     daily_threshold: int,
 ) -> tuple[str, int, int]:
     """
@@ -464,14 +454,10 @@ def process_file(
     for idx, chunk in enumerate(chunks, start=1):
         label = f"chunk {idx}/{nb_chunks}"
 
-        # Vérification quota avant chaque chunk (sauf le premier qui compte
-        # déjà dans la boucle principale)
         if idx > 1 and (requests_today + nb_requests) >= daily_threshold:
             print(f"  [stop quota] Quota atteint avant {label}.")
             break
 
-        # Attente TPM entre chunks (jamais avant le 1er chunk du fichier —
-        # la boucle principale gère la pause entre fichiers)
         if idx > 1:
             print(f"  [attente {inter_sleep:.0f}s] fenêtre TPM avant {label}...")
             time.sleep(inter_sleep)
@@ -552,6 +538,9 @@ def main() -> int:
     requests_today = int(progress.get("requests_today", 0))
     all_files      = sorted(p for p in input_dir.glob("*.json") if p.is_file())
 
+    # ── Fichiers déjà présents dans le dossier de sortie (vérification disque) ──
+    already_in_output = {p.name for p in output_dir.glob("*.json")} if output_dir.is_dir() else set()
+
     # ── Sélection des fichiers à traiter ──────────────────────────────────────
     if args.files:
         selected = []
@@ -562,19 +551,23 @@ def main() -> int:
                 print(f"[avertissement] Fichier introuvable, ignoré : {name}")
                 continue
             selected.append(target)
-        pending = [f for f in selected if f.name not in processed]
+        pending = [f for f in selected if f.name not in processed and f.name not in already_in_output]
     else:
         # Mode principal : tous les fichiers non encore traités
-        pending = [f for f in all_files if f.name not in processed]
+        pending = [f for f in all_files if f.name not in processed and f.name not in already_in_output]
         if args.max_files > 0:
             pending = pending[: args.max_files]
+
+    skipped_output = len(already_in_output.intersection({f.name for f in all_files}))
+    if skipped_output:
+        print(f"[info] {skipped_output} fichier(s) ignorés car déjà présents dans le dossier de sortie.")
 
     if not pending:
         print("[info] Tous les fichiers sont déjà traités. Rien à faire.")
         return 0
 
     # Estimation du temps total
-    avg_chunks     = 2          # estimation conservative
+    avg_chunks     = 2
     total_requests = len(pending) * avg_chunks
     est_minutes    = (total_requests * args.inter_request_sleep) / 60
 
@@ -584,6 +577,7 @@ def main() -> int:
     print(f"  Pause entre appels   : {args.inter_request_sleep:.0f}s")
     print(f"  Fichiers total       : {len(all_files)}")
     print(f"  Déjà traités         : {len(processed)}")
+    print(f"  Déjà dans output/    : {len(already_in_output)}")
     print(f"  À traiter            : {len(pending)}")
     print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_LIMIT}")
     print(f"  Durée estimée        : ~{est_minutes:.0f} min (si ~{avg_chunks} chunks/fichier)")
@@ -601,9 +595,6 @@ def main() -> int:
 
         print(f"\n[{i}/{len(pending)}] {file_path.name}")
 
-        # Pause entre fichiers (sauf avant le tout premier)
-        # On attend ici pour respecter le TPM entre le dernier chunk
-        # du fichier précédent et le premier chunk du fichier suivant.
         if i > 1:
             print(f"  [attente {args.inter_request_sleep:.0f}s] fenêtre TPM entre fichiers...")
             time.sleep(args.inter_request_sleep)
