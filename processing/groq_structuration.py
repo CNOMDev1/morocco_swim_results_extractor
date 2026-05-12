@@ -28,27 +28,21 @@ from typing import Any
 
 from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
 
-# ── Modèle ────────────────────────────────────────────────────────────────────
 DEFAULT_MODEL = "llama-3.1-8b-instant"
 
-# ── Limites Groq tier gratuit ──────────────────────────────────────────────────
 DAILY_REQUEST_LIMIT     = 14_400
 DAILY_REQUEST_THRESHOLD = 14_000
 
-# ── Timing ────────────────────────────────────────────────────────────────────
 INTER_REQUEST_SLEEP  = 62.0
 RATE_LIMIT_SLEEP     = 65.0
 NETWORK_MAX_RETRIES  = 5
 NETWORK_BACKOFF_BASE = 2
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
 INITIAL_CHUNK_CHARS = 12_000
 MIN_CHUNK_CHARS     = 3_000
 
-# ── Catégories valides ────────────────────────────────────────────────────────
 VALID_CATEGORIES = {"BENJAMINS", "MINIMES", "CADETS", "JUNIORS", "SENIORS"}
 
-# ── Prompt système ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Tu es un extracteur de données de compétitions de natation marocaine.
 Analyse le texte fourni et retourne UNIQUEMENT un objet JSON valide, sans markdown, sans backticks, sans explication.
 
@@ -505,10 +499,6 @@ def process_file(
     )
     return "OK", total_tokens, nb_requests
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
     args = parse_args()
