@@ -52,7 +52,7 @@ from groq_structuration import (
 # Configuration — modifie ces chemins selon ton environnement
 # ══════════════════════════════════════════════════════════════════════════════
 
-INPUT_DIR     = Path("/Users/nouhailaimaneabbassi/Desktop/SwimResultsExtractor/data/json_from_pdfs/pdfs_results_help")
+INPUT_DIR     = Path("/Users/nouhailaimaneabbassi/Desktop/SwimResultsExtractor/data/json_from_pdfs/pdfs_results")
 OUTPUT_DIR    = Path("/Users/nouhailaimaneabbassi/Desktop/SwimResultsExtractor/data/json_structures")
 PROGRESS_FILE = Path(__file__).resolve().parent / "progress_groq.json"
 ERRORS_DIR    = Path(__file__).resolve().parent / "errors"

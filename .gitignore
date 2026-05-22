@@ -3,4 +3,4 @@ data/json_structures/
 __pycache__/
 processing/progress_groq.json
 processing/processing_groq.log
-processing/.env
+extractors/.env

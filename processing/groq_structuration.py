@@ -1,23 +1,5 @@
-#!/usr/bin/env python3
-"""Structure les JSON OCR de natation avec Groq.
-
-Usage:
-    pip install groq
-    export GROQ_API_KEY="gsk_..."
-
-    # Traiter TOUS les fichiers :
-    python groq_structuration.py
-
-    # Traiter des fichiers spécifiques :
-    python groq_structuration.py --files "fichier1.json" "fichier2.json" --debug
-
-    # Limiter à N fichiers :
-    python groq_structuration.py --max-files 10 --debug
-"""
-
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
@@ -27,19 +9,29 @@ from pathlib import Path
 from typing import Any
 
 from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
+from dotenv import load_dotenv
 
-DEFAULT_MODEL = "llama-3.1-8b-instant"
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
-DAILY_REQUEST_LIMIT     = 14_400
+MODEL = "llama-3.1-8b-instant"
+
+INPUT_DIR     = Path("/Users/nouhailaimaneabbassi/Desktop/SwimResultsExtractor/data/json_from_pdfs/pdfs_results")
+OUTPUT_DIR    = Path("/Users/nouhailaimaneabbassi/Desktop/SwimResultsExtractor/data/json_structures/pdfs_results")
+SCRIPT_DIR    = Path(__file__).resolve().parent
+PROGRESS_FILE = SCRIPT_DIR / "progress_groq.json"
+ERRORS_DIR    = SCRIPT_DIR / "errors"
+LOG_FILE      = SCRIPT_DIR / "processing_groq.log"
+
 DAILY_REQUEST_THRESHOLD = 14_000
-
-INTER_REQUEST_SLEEP  = 62.0
-RATE_LIMIT_SLEEP     = 65.0
-NETWORK_MAX_RETRIES  = 5
-NETWORK_BACKOFF_BASE = 2
+INTER_REQUEST_SLEEP     = 62.0
+RATE_LIMIT_SLEEP        = 65.0
+NETWORK_MAX_RETRIES     = 5
+NETWORK_BACKOFF_BASE    = 2
 
 INITIAL_CHUNK_CHARS = 12_000
 MIN_CHUNK_CHARS     = 3_000
+
+DEBUG = False
 
 VALID_CATEGORIES = {"BENJAMINS", "MINIMES", "CADETS", "JUNIORS", "SENIORS"}
 
@@ -82,56 +74,6 @@ DEFAULT_PROGRESS: dict[str, Any] = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════════════════════════════
-
-def parse_args() -> argparse.Namespace:
-    default_input = (
-        "/Users/nouhailaimaneabbassi/Desktop/SwimResultsExtractor"
-        "/data/json_from_pdfs/pdfs_results"
-    )
-    default_output = (
-        "/Users/nouhailaimaneabbassi/Desktop/SwimResultsExtractor"
-        "/data/json_structures"
-    )
-    script_dir = Path(__file__).resolve().parent
-
-    parser = argparse.ArgumentParser(
-        description="Structure tous les JSON OCR de natation avec Groq (traitement complet)."
-    )
-    parser.add_argument("--input-dir",  default=default_input,
-        help="Dossier source des JSON OCR.")
-    parser.add_argument("--output-dir", default=default_output,
-        help="Dossier de sortie des JSON structurés.")
-    parser.add_argument("--progress-file",
-        default=str(script_dir / "progress_groq.json"),
-        help="Fichier de suivi (reprend là où on s'est arrêté).")
-    parser.add_argument("--errors-dir",
-        default=str(script_dir / "errors"),
-        help="Dossier pour les réponses non parsables.")
-    parser.add_argument("--log-file",
-        default=str(script_dir / "processing_groq.log"),
-        help="Fichier de log.")
-    parser.add_argument("--model", default=DEFAULT_MODEL,
-        help=f"Modèle Groq (défaut: {DEFAULT_MODEL}).")
-    parser.add_argument("--daily-threshold", type=int, default=DAILY_REQUEST_THRESHOLD,
-        help="Limite de requêtes/jour avant arrêt automatique.")
-    parser.add_argument("--inter-request-sleep", type=float, default=INTER_REQUEST_SLEEP,
-        help=f"Pause entre chaque appel API en secondes (défaut: {INTER_REQUEST_SLEEP}s).")
-    parser.add_argument("--max-files", type=int, default=0,
-        help="Nombre max de fichiers à traiter (0 = tous).")
-    parser.add_argument("--files", nargs="+", default=[], metavar="FICHIER",
-        help="Fichiers spécifiques à traiter (noms seulement, pas le chemin complet).")
-    parser.add_argument("--debug", action="store_true",
-        help="Affiche les détails de chaque requête.")
-    return parser.parse_args()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Logger
-# ══════════════════════════════════════════════════════════════════════════════
-
 def setup_logger(log_path: Path) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("groq_structuration")
@@ -143,10 +85,6 @@ def setup_logger(log_path: Path) -> logging.Logger:
     logger.propagate = False
     return logger
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Progression / quota
-# ══════════════════════════════════════════════════════════════════════════════
 
 def load_progress(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -174,10 +112,6 @@ def maybe_reset_daily_quota(progress: dict[str, Any]) -> None:
         progress["requests_today"]  = 0
         print(f"[quota] Nouveau jour ({today}) — compteur remis à 0.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Extraction du texte source
-# ══════════════════════════════════════════════════════════════════════════════
 
 def extract_text(payload: Any) -> str:
     if not isinstance(payload, dict):
@@ -209,10 +143,6 @@ def infer_source_filename(input_name: str, payload: Any) -> str:
     return f"{Path(input_name).stem}.pdf"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Chunking
-# ══════════════════════════════════════════════════════════════════════════════
-
 def split_into_chunks(text: str, max_chars: int) -> list[str]:
     """Découpe proprement aux sauts de ligne pour ne jamais couper une ligne de nageur."""
     if len(text) <= max_chars:
@@ -232,10 +162,6 @@ def split_into_chunks(text: str, max_chars: int) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Fusion des tables multi-chunks
-# ══════════════════════════════════════════════════════════════════════════════
-
 def merge_tables(all_tables: list[list[dict]]) -> list[dict]:
     """Même catégorie dans plusieurs chunks → rows concaténées."""
     merged: dict[str, dict] = {}
@@ -251,23 +177,15 @@ def merge_tables(all_tables: list[list[dict]]) -> list[dict]:
             merged[cat]["rows"].extend(table.get("rows", []))
     return list(merged.values())
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Appel Groq — 1 chunk
-# ══════════════════════════════════════════════════════════════════════════════
-
 def call_groq_chunk(
-    client:       Groq,
-    model_name:   str,
-    chunk:        str,
-    chunk_label:  str,
-    inter_sleep:  float,
-    debug:        bool,
+    client:      Groq,
+    chunk:       str,
+    chunk_label: str,
 ) -> tuple[str, int]:
     """
     Envoie un chunk à Groq.
     - 429 RPM  → attend retry-after puis réessaie
-    - 413 TPM  → réduit le chunk de moitié, attend 62s, réessaie
+    - 413 TPM  → réduit le chunk de moitié, attend INTER_REQUEST_SLEEP, réessaie
     - 5xx      → backoff exponentiel
     Retourne (réponse_brute, tokens_utilisés).
     """
@@ -275,13 +193,13 @@ def call_groq_chunk(
 
     for attempt in range(1, NETWORK_MAX_RETRIES + 1):
         try:
-            if debug:
+            if DEBUG:
                 print(f"  [debug] {chunk_label} tentative {attempt} "
                       f"({len(current_text)} chars)...")
 
             t0 = time.perf_counter()
             response = client.chat.completions.create(
-                model=model_name,
+                model=MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user",   "content": (
@@ -297,7 +215,7 @@ def call_groq_chunk(
             text_out  = response.choices[0].message.content or ""
             total_tok = response.usage.total_tokens if response.usage else 0
 
-            if debug:
+            if DEBUG:
                 print(f"  [debug] {chunk_label} ✓ {elapsed:.1f}s | {total_tok} tokens")
 
             return text_out, total_tok
@@ -323,13 +241,12 @@ def call_groq_chunk(
                 new_size = max(len(current_text) // 2, MIN_CHUNK_CHARS)
                 if new_size < len(current_text) and new_size >= MIN_CHUNK_CHARS:
                     print(f"  [413 TPM] {chunk_label} : {len(current_text)} chars trop grand "
-                          f"→ réduit à {new_size} chars, attente {inter_sleep:.0f}s...")
+                          f"→ réduit à {new_size} chars, attente {INTER_REQUEST_SLEEP:.0f}s...")
                     current_text = current_text[:new_size]
-                    time.sleep(inter_sleep)
+                    time.sleep(INTER_REQUEST_SLEEP)
                     continue
                 raise RuntimeError(
-                    f"{chunk_label} : chunk à {len(current_text)} chars encore trop grand. "
-                    "Essaie un autre modèle ou attends que la fenêtre TPM se réinitialise."
+                    f"{chunk_label} : chunk à {len(current_text)} chars encore trop grand."
                 ) from exc
 
             transient = code in (500, 502, 503, 504) or "timeout" in str(exc).lower()
@@ -354,10 +271,6 @@ def call_groq_chunk(
 
     raise RuntimeError(f"Échec après {NETWORK_MAX_RETRIES} tentatives ({chunk_label})")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Normalisation
-# ══════════════════════════════════════════════════════════════════════════════
 
 def normalize_headers(raw_headers: Any, first_row: Any) -> list[str]:
     if isinstance(raw_headers, list):
@@ -402,24 +315,12 @@ def normalize_output(raw: Any, source_file: str) -> dict[str, Any]:
     return {"source_file": source_file, "tables": tables_out}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Traitement d'un fichier
-# ══════════════════════════════════════════════════════════════════════════════
-
 def process_file(
-    file_path:    Path,
-    output_dir:   Path,
-    errors_dir:   Path,
-    client:       Groq,
-    model_name:   str,
-    inter_sleep:  float,
-    debug:        bool,
+    file_path:      Path,
+    client:         Groq,
     requests_today: int,
-    daily_threshold: int,
 ) -> tuple[str, int, int]:
-    """
-    Retourne (status, tokens_utilisés, nb_requêtes_effectuées).
-    """
+    """Retourne (status, tokens_utilisés, nb_requêtes_effectuées)."""
     try:
         payload = json.loads(file_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -429,41 +330,36 @@ def process_file(
     if not text:
         return "Aucun texte exploitable.", 0, 0
 
-    chunks      = split_into_chunks(text, INITIAL_CHUNK_CHARS)
-    nb_chunks   = len(chunks)
-    total_chars = len(text)
+    chunks    = split_into_chunks(text, INITIAL_CHUNK_CHARS)
+    nb_chunks = len(chunks)
 
-    if debug:
-        print(f"  [debug] {total_chars} chars → {nb_chunks} chunk(s) "
-              f"de ~{INITIAL_CHUNK_CHARS} chars max")
-    else:
-        if nb_chunks > 1:
-            print(f"  → {nb_chunks} chunks ({total_chars} chars), "
-                  f"durée estimée ~{(nb_chunks - 1) * inter_sleep:.0f}s d'attente")
+    if DEBUG:
+        print(f"  [debug] {len(text)} chars → {nb_chunks} chunk(s) de ~{INITIAL_CHUNK_CHARS} chars max")
+    elif nb_chunks > 1:
+        print(f"  → {nb_chunks} chunks ({len(text)} chars), "
+              f"durée estimée ~{(nb_chunks - 1) * INTER_REQUEST_SLEEP:.0f}s d'attente")
 
-    all_tables:    list[list[dict]] = []
-    total_tokens:  int = 0
-    nb_requests:   int = 0
+    all_tables:   list[list[dict]] = []
+    total_tokens: int = 0
+    nb_requests:  int = 0
 
     for idx, chunk in enumerate(chunks, start=1):
         label = f"chunk {idx}/{nb_chunks}"
 
-        if idx > 1 and (requests_today + nb_requests) >= daily_threshold:
+        if idx > 1 and (requests_today + nb_requests) >= DAILY_REQUEST_THRESHOLD:
             print(f"  [stop quota] Quota atteint avant {label}.")
             break
 
         if idx > 1:
-            print(f"  [attente {inter_sleep:.0f}s] fenêtre TPM avant {label}...")
-            time.sleep(inter_sleep)
+            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] fenêtre TPM avant {label}...")
+            time.sleep(INTER_REQUEST_SLEEP)
 
         try:
-            raw_response, used_tokens = call_groq_chunk(
-                client, model_name, chunk, label, inter_sleep, debug
-            )
+            raw_response, used_tokens = call_groq_chunk(client, chunk, label)
             nb_requests += 1
         except RuntimeError as exc:
-            errors_dir.mkdir(parents=True, exist_ok=True)
-            (errors_dir / f"{file_path.stem}_chunk{idx}_error.txt").write_text(
+            ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+            (ERRORS_DIR / f"{file_path.stem}_chunk{idx}_error.txt").write_text(
                 str(exc), encoding="utf-8"
             )
             print(f"  ✗ {label} erreur : {exc}")
@@ -475,11 +371,11 @@ def process_file(
         try:
             parsed = json.loads(raw_response)
         except json.JSONDecodeError:
-            errors_dir.mkdir(parents=True, exist_ok=True)
-            (errors_dir / f"{file_path.stem}_chunk{idx}_invalid.txt").write_text(
+            ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+            (ERRORS_DIR / f"{file_path.stem}_chunk{idx}_invalid.txt").write_text(
                 raw_response or "", encoding="utf-8"
             )
-            if debug:
+            if DEBUG:
                 print(f"  [debug] {label} réponse non-JSON → sauvegardée dans errors/")
             continue
 
@@ -493,84 +389,53 @@ def process_file(
     merged_tables = merge_tables(all_tables)
     output        = normalize_output({"tables": merged_tables}, source_file)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / file_path.name).write_text(
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / file_path.name).write_text(
         json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return "OK", total_tokens, nb_requests
 
 
 def main() -> int:
-    args = parse_args()
-
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         print("[erreur] GROQ_API_KEY manquante.")
         print("         export GROQ_API_KEY='gsk_...'")
         return 1
 
-    input_dir     = Path(args.input_dir)
-    output_dir    = Path(args.output_dir)
-    progress_file = Path(args.progress_file)
-    errors_dir    = Path(args.errors_dir)
-    logger        = setup_logger(Path(args.log_file))
-
-    if not input_dir.is_dir():
-        print(f"[erreur] Dossier introuvable : {input_dir}")
+    if not INPUT_DIR.is_dir():
+        print(f"[erreur] Dossier introuvable : {INPUT_DIR}")
         return 1
 
+    logger = setup_logger(LOG_FILE)
     client = Groq(api_key=api_key)
 
-    progress = load_progress(progress_file)
+    progress = load_progress(PROGRESS_FILE)
     maybe_reset_daily_quota(progress)
 
     processed      = set(progress.get("processed_files", []))
     requests_today = int(progress.get("requests_today", 0))
-    all_files      = sorted(p for p in input_dir.glob("*.json") if p.is_file())
+    all_files      = sorted(p for p in INPUT_DIR.glob("*.json") if p.is_file())
 
-    # ── Fichiers déjà présents dans le dossier de sortie (vérification disque) ──
-    already_in_output = {p.name for p in output_dir.glob("*.json")} if output_dir.is_dir() else set()
+    already_in_output = {p.name for p in OUTPUT_DIR.glob("*.json")} if OUTPUT_DIR.is_dir() else set()
+    pending = [f for f in all_files if f.name not in processed and f.name not in already_in_output]
 
-    # ── Sélection des fichiers à traiter ──────────────────────────────────────
-    if args.files:
-        selected = []
-        for name in args.files:
-            p      = Path(name)
-            target = p if p.is_absolute() else input_dir / p.name
-            if not target.exists():
-                print(f"[avertissement] Fichier introuvable, ignoré : {name}")
-                continue
-            selected.append(target)
-        pending = [f for f in selected if f.name not in processed and f.name not in already_in_output]
-    else:
-        # Mode principal : tous les fichiers non encore traités
-        pending = [f for f in all_files if f.name not in processed and f.name not in already_in_output]
-        if args.max_files > 0:
-            pending = pending[: args.max_files]
-
-    skipped_output = len(already_in_output.intersection({f.name for f in all_files}))
-    if skipped_output:
-        print(f"[info] {skipped_output} fichier(s) ignorés car déjà présents dans le dossier de sortie.")
+    skipped = len(already_in_output.intersection({f.name for f in all_files}))
+    if skipped:
+        print(f"[info] {skipped} fichier(s) ignorés car déjà présents dans le dossier de sortie.")
 
     if not pending:
         print("[info] Tous les fichiers sont déjà traités. Rien à faire.")
         return 0
 
-    # Estimation du temps total
-    avg_chunks     = 2
-    total_requests = len(pending) * avg_chunks
-    est_minutes    = (total_requests * args.inter_request_sleep) / 60
-
     print("=" * 60)
-    print(f"  Modèle               : {args.model}")
-    print(f"  Chunk max            : {INITIAL_CHUNK_CHARS} chars (~{INITIAL_CHUNK_CHARS//4} tokens)")
-    print(f"  Pause entre appels   : {args.inter_request_sleep:.0f}s")
+    print(f"  Modèle               : {MODEL}")
+    print(f"  Chunk max            : {INITIAL_CHUNK_CHARS} chars")
+    print(f"  Pause entre appels   : {INTER_REQUEST_SLEEP:.0f}s")
     print(f"  Fichiers total       : {len(all_files)}")
     print(f"  Déjà traités         : {len(processed)}")
-    print(f"  Déjà dans output/    : {len(already_in_output)}")
     print(f"  À traiter            : {len(pending)}")
-    print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_LIMIT}")
-    print(f"  Durée estimée        : ~{est_minutes:.0f} min (si ~{avg_chunks} chunks/fichier)")
+    print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
     print("=" * 60)
 
     ok_count  = 0
@@ -578,7 +443,7 @@ def main() -> int:
 
     for i, file_path in enumerate(pending, start=1):
 
-        if requests_today >= args.daily_threshold:
+        if requests_today >= DAILY_REQUEST_THRESHOLD:
             print(f"\n[stop] Quota journalier atteint ({requests_today} requêtes). "
                   f"Relance demain — {len(pending) - i + 1} fichier(s) restants.")
             break
@@ -586,30 +451,24 @@ def main() -> int:
         print(f"\n[{i}/{len(pending)}] {file_path.name}")
 
         if i > 1:
-            print(f"  [attente {args.inter_request_sleep:.0f}s] fenêtre TPM entre fichiers...")
-            time.sleep(args.inter_request_sleep)
+            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] fenêtre TPM entre fichiers...")
+            time.sleep(INTER_REQUEST_SLEEP)
 
         status      = "ERREUR"
         used_tokens = 0
         nb_req      = 0
         try:
             status, used_tokens, nb_req = process_file(
-                file_path       = file_path,
-                output_dir      = output_dir,
-                errors_dir      = errors_dir,
-                client          = client,
-                model_name      = args.model,
-                inter_sleep     = args.inter_request_sleep,
-                debug           = args.debug,
-                requests_today  = requests_today,
-                daily_threshold = args.daily_threshold,
+                file_path      = file_path,
+                client         = client,
+                requests_today = requests_today,
             )
         except Exception as exc:
             status = f"Exception : {exc}"
             nb_req = 1
 
-        requests_today             += nb_req
-        progress["requests_today"]  = requests_today
+        requests_today            += nb_req
+        progress["requests_today"] = requests_today
 
         if status == "OK":
             ok_count += 1
@@ -618,26 +477,25 @@ def main() -> int:
             logger.info("%s | OK | tokens=%d | req_total=%d",
                         file_path.name, used_tokens, requests_today)
             print(f"  ✓ OK | {used_tokens} tokens | "
-                  f"requêtes aujourd'hui : {requests_today}/{DAILY_REQUEST_LIMIT}")
+                  f"requêtes aujourd'hui : {requests_today}/{DAILY_REQUEST_THRESHOLD}")
         else:
             err_count += 1
             logger.error("%s | ERREUR | %s", file_path.name, status)
             print(f"  ✗ ERREUR : {status}")
 
-        save_progress(progress_file, progress)
+        save_progress(PROGRESS_FILE, progress)
 
-    # ── Résumé final ──────────────────────────────────────────────────────────
     remaining = len(pending) - ok_count - err_count
     print("\n" + "=" * 60)
-    print(f"  ✓ Succès          : {ok_count}")
-    print(f"  ✗ Erreurs         : {err_count}")
+    print(f"  ✓ Succès             : {ok_count}")
+    print(f"  ✗ Erreurs            : {err_count}")
     if remaining > 0:
-        print(f"  ⏸ Non traités     : {remaining} (quota atteint)")
-    print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_LIMIT}")
-    print(f"  Total traités     : {len(processed)} / {len(all_files)}")
+        print(f"  ⏸ Non traités        : {remaining} (quota atteint)")
+    print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
+    print(f"  Total traités        : {len(processed)} / {len(all_files)}")
     print("=" * 60)
 
-    save_progress(progress_file, progress)
+    save_progress(PROGRESS_FILE, progress)
     return 0
 
 
