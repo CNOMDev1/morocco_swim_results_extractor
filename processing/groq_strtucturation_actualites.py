@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
+import re
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,12 +15,15 @@ from groq import APIConnectionError, APIStatusError, Groq, RateLimitError
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+# Clé dédiée actualités (processing/.env) ; repli sur GROQ_API_KEY si absente
+GROQ_API_KEY_ENV = "GROQ_API_KEY1"
+
 MODEL = "llama-3.1-8b-instant"
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-INPUT_DIR = PROJECT_ROOT / "data" / "json_from_pdfs" / "pdfs_results_actualites" / "2016"
-OUTPUT_DIR = PROJECT_ROOT / "data" / "json_structures" / "results_from_actualites" / "2016"
 SCRIPT_DIR = Path(__file__).resolve().parent
+BASE_DIR = SCRIPT_DIR.parent
+INPUT_DIR = BASE_DIR / "data" / "json_from_pdfs" / "pdfs_results_actualites" / "2016"
+OUTPUT_DIR = BASE_DIR / "data" / "json_structures" / "results_from_actualites" / "2016"
 PROGRESS_FILE = SCRIPT_DIR / "progress_groq_actualites_2016.json"
 ERRORS_DIR = SCRIPT_DIR / "errors_actualites"
 LOG_FILE = SCRIPT_DIR / "processing_groq_actualites_2016.log"
@@ -34,83 +39,96 @@ MIN_CHUNK_CHARS = 3_000
 
 DEBUG = False
 
-DEFAULT_HEADERS = [
-    "Place",
-    "Nom et prénom",
-    "Nation",
-    "Naissance",
-    "Club",
-    "Temps",
-    "Points",
-    "Temps de passage",
-]
-
-CATEGORY_ALIASES = {
-    "BENJAMIN": "BENJAMINS",
-    "BENJAMINS": "BENJAMINS",
-    "MINIME": "MINIMES",
-    "MINIMES": "MINIMES",
-    "CADET": "CADETS",
-    "CADETS": "CADETS",
-    "JUNIOR": "JUNIORS",
-    "JUNIORS": "JUNIORS",
-    "SENIOR": "SENIORS",
-    "SENIORS": "SENIORS",
+# Même format que data/html_results/*.json (scraper/html_results_scraper.py)
+TARGET_SCHEMA: dict[str, Any] = {
+    "SwimDate": "2016-07-24",
+    "SwimYear": 2016,
+    "Meet": "CHAMPIONNATS DU MAROC M C J S ET OPEN - CASABLANCA",
+    "location": "",
+    "Country": "MAR",
+    "epreuves": [
+        {
+            "Event": "50 FR SCM",
+            "Distance": 50,
+            "Stroke": "FR",
+            "Course": "SCM",
+            "PoolLength": 25,
+            "tour": "Finale A",
+            "performances": [
+                {
+                    "Rank": 1,
+                    "club": "TSC",
+                    "SwimTime": "28.14",
+                    "SwimTimeSeconds": 28.14,
+                    "Status": "OK",
+                    "Speed": 1.7768,
+                    "swimmer": {
+                        "Name": "MANA Noura",
+                        "Gender": "F",
+                        "Year_of_birth": 1997,
+                        "Age": 19,
+                        "Nationality": "MAR",
+                    },
+                }
+            ],
+        }
+    ],
 }
 
-VALID_CATEGORIES = set(CATEGORY_ALIASES.values())
-
-FIELD_ALIASES: dict[str, tuple[str, ...]] = {
-    "Place": ("Place", "Rg", "Rang"),
-    "Nom et prénom": ("Nom et prénom", "Nom et prenom", "Nom", "Nageur"),
-    "Nation": ("Nation", "Nat"),
-    "Naissance": ("Naissance", "Année", "Annee", "Date de naissance"),
-    "Club": ("Club", "Equipe", "Équipe"),
-    "Temps": ("Temps", "Tps", "Temps final"),
-    "Points": ("Points", "Pts", "Point"),
-    "Temps de passage": (
-        "Temps de passage",
-        "Passage",
-        "Split",
-        "Splits",
-        "Obs",
-        "Observation",
-    ),
+STROKE_ALIASES: dict[str, str] = {
+    "FR": "FR",
+    "FREE": "FR",
+    "CRAWL": "FR",
+    "NAGE LIBRE": "FR",
+    "NL": "FR",
+    "DOS": "DOS",
+    "BK": "DOS",
+    "BACK": "DOS",
+    "BR": "BR",
+    "BREAST": "BR",
+    "BRASSE": "BR",
+    "PAP": "PAP",
+    "FLY": "PAP",
+    "FL": "PAP",
+    "PAPILLON": "PAP",
+    "4N": "4N",
+    "IM": "4N",
+    "4 NAGES": "4N",
+    "REL": "REL",
+    "RELAIS": "REL",
 }
 
-SYSTEM_PROMPT = """Tu es un extracteur de donnees de competitions de natation marocaine a partir de resultats publies dans les actualites FRMN.
+SYSTEM_PROMPT = """Tu es un extracteur de résultats de natation FRMN (actualités / PDF OCR).
 Analyse le texte fourni et retourne UNIQUEMENT un objet JSON valide, sans markdown, sans backticks, sans explication.
 
-Schema attendu :
-{
-  "tables": [
-    {
-      "category": "<BENJAMINS|MINIMES|CADETS|JUNIORS|SENIORS>",
-      "headers": ["Place", "Nom et prénom", "Nation", "Naissance", "Club", "Temps", "Points", "Temps de passage"],
-      "rows": [
-        {
-          "Place": "",
-          "Nom et prénom": "",
-          "Nation": "",
-          "Naissance": "",
-          "Club": "",
-          "Temps": "",
-          "Points": "",
-          "Temps de passage": ""
-        }
-      ]
-    }
-  ]
-}
+Schéma cible (identique aux fichiers data/html_results/) :
+{schema}
 
-Regles absolues :
-- Extraire UNIQUEMENT les lignes compatibles avec ce schema.
-- Ne pas inventer de nageurs ni de valeurs.
-- Si un champ est absent, illisible ou non applicable, mettre "".
-- category doit etre exactement l'une de : BENJAMINS, MINIMES, CADETS, JUNIORS, SENIORS.
-- Ignorer les categories non autorisees (ex: POUSSINS) et les sections non compatibles avec ce schema.
-- Un fichier peut contenir plusieurs tables (une par categorie trouvee dans le texte).
-- Retourner uniquement le JSON brut, rien d'autre."""
+Le texte peut provenir d'un article ou PDF d'actualité : tableaux de résultats, records, classements.
+Extraire chaque nageur avec temps et club lorsque le texte le permet.
+Si le document ne contient que des totaux par club ou des points sans performances individuelles,
+retourner "epreuves": [] en renseignant quand même SwimDate, SwimYear, Meet, location si possible.
+
+Règles absolues :
+- Ne pas inventer de nageurs : extraire UNIQUEMENT ce qui est dans le texte.
+- Champ absent ou illisible → null (sauf "location" → chaîne vide "").
+- SwimDate : date ISO YYYY-MM-DD si identifiable dans le titre ou le texte.
+- SwimYear : année entière déduite de SwimDate.
+- Meet : nom de la compétition / article sans date ni ville superflues.
+- location : ville ou "".
+- Country : "MAR" sauf indication contraire explicite.
+- Bassin FRMN "Grand bassin" / "Petit bassin" → Course "SCM", PoolLength 25.
+- Event : "{{distance}} {{stroke}} {{course}}" (ex. "50 DOS SCM", "100 FR SCM").
+- Stroke : FR, DOS, BR, PAP, 4N, REL (NL/nage libre → FR, pap → PAP, dos → DOS).
+- Relais "4 x 50 m …" : Distance = 4 × distance d'un relais, Stroke = "REL".
+- DAMES → Gender "F" ; MESSIEURS → Gender "M".
+- tour : catégorie d'âge (BENJAMINS, MINIMES, CADETS, JUNIORS, SENIORS, POUSSINS) ou tour (Finale A, Séries…).
+- Rank : entier si "1.", "2."… ; null si "NC.".
+- SwimTime / SwimTimeSeconds / Status / Speed / swimmer.Age : comme pour les résultats officiels FRMN.
+- Une entrée "epreuves" par combinaison (épreuve + tour/catégorie).
+- Retourner uniquement le JSON brut.""".format(
+    schema=json.dumps(TARGET_SCHEMA, ensure_ascii=False, indent=2),
+)
 
 DEFAULT_PROGRESS: dict[str, Any] = {
     "requests_today": 0,
@@ -121,6 +139,13 @@ DEFAULT_PROGRESS: dict[str, Any] = {
 
 class FatalGroqError(RuntimeError):
     """Erreur fatale de configuration/acces Groq: inutile de continuer le batch."""
+
+
+def get_groq_api_key() -> str:
+    return (
+        os.getenv(GROQ_API_KEY_ENV, "").strip()
+        or os.getenv("GROQ_API_KEY", "").strip()
+    )
 
 
 def setup_logger(log_path: Path) -> logging.Logger:
@@ -162,7 +187,7 @@ def maybe_reset_daily_quota(progress: dict[str, Any]) -> None:
     if progress.get("last_reset_date") != today:
         progress["last_reset_date"] = today
         progress["requests_today"] = 0
-        print(f"[quota] Nouveau jour ({today}) - compteur remis a 0.")
+        print(f"[quota] Nouveau jour ({today}) — compteur remis à 0.")
 
 
 def extract_text(payload: Any) -> str:
@@ -183,26 +208,7 @@ def extract_text(payload: Any) -> str:
         for page in pages
         if isinstance(page, dict) and isinstance(page.get("text"), str)
     ]
-    joined = "\n\n".join(part.strip() for part in parts if part.strip())
-    return joined.strip()
-
-
-def infer_source_filename(input_name: str, payload: Any) -> str:
-    if isinstance(payload, dict):
-        for key in (
-            "filename",
-            "source_pdf",
-            "source_file",
-            "pdf_file",
-            "pdf_filename",
-            "file_name",
-            "file",
-        ):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                clean = Path(value.strip()).name
-                return clean if clean.lower().endswith(".pdf") else f"{Path(clean).stem}.pdf"
-    return f"{Path(input_name).stem}.pdf"
+    return "\n\n".join(part.strip() for part in parts if part.strip())
 
 
 def split_into_chunks(text: str, max_chars: int) -> list[str]:
@@ -227,31 +233,102 @@ def split_into_chunks(text: str, max_chars: int) -> list[str]:
     return [chunk for chunk in chunks if chunk.strip()]
 
 
-def normalize_category(raw_category: Any) -> str:
-    category = str(raw_category or "").strip().upper()
-    return CATEGORY_ALIASES.get(category, "")
+def _epreuve_key(epreuve: dict) -> str:
+    parts = [
+        str(epreuve.get("Event", "")).strip(),
+        str(epreuve.get("Distance", "")).strip(),
+        str(epreuve.get("Stroke", "")).strip(),
+        str(epreuve.get("Course", "")).strip(),
+        str(epreuve.get("tour", "")).strip(),
+    ]
+    return "|".join(parts)
 
 
-def merge_tables(all_tables: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    merged: dict[str, dict[str, Any]] = {}
-    for tables in all_tables:
-        for table in tables:
-            category = normalize_category(table.get("category"))
-            if category not in VALID_CATEGORIES:
+def merge_epreuves(all_epreuves: list[list[dict]]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for epreuves in all_epreuves:
+        for ep in epreuves:
+            if not isinstance(ep, dict):
                 continue
-
-            if category not in merged:
-                merged[category] = {
-                    "category": category,
-                    "headers": DEFAULT_HEADERS[:],
-                    "rows": [],
+            key = _epreuve_key(ep)
+            if key not in merged:
+                merged[key] = {
+                    "Event": ep.get("Event"),
+                    "Distance": ep.get("Distance"),
+                    "Stroke": ep.get("Stroke"),
+                    "Course": ep.get("Course"),
+                    "PoolLength": ep.get("PoolLength"),
+                    "tour": ep.get("tour"),
+                    "performances": [],
                 }
-
-            rows = table.get("rows", [])
-            if isinstance(rows, list):
-                merged[category]["rows"].extend(rows)
-
+            perfs = ep.get("performances", [])
+            if isinstance(perfs, list):
+                merged[key]["performances"].extend(perfs)
     return list(merged.values())
+
+
+def merge_metadata(chunks: list[dict]) -> dict[str, Any]:
+    fields = ("SwimDate", "SwimYear", "Meet", "location", "Country")
+    out: dict[str, Any] = {k: None for k in fields}
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        for key in fields:
+            if out[key] is None:
+                val = chunk.get(key)
+                if val is not None and val != "":
+                    out[key] = val
+    return out
+
+
+def parse_swim_time_seconds(swim_time: str | None) -> float | None:
+    if not swim_time or not isinstance(swim_time, str):
+        return None
+    s = swim_time.strip()
+    if not s or s.lower() in {"frf n.d.", "n.d.", "-"}:
+        return None
+    if re.search(r"dsq|disqual|abandon", s, re.IGNORECASE):
+        return None
+    try:
+        if ":" in s:
+            parts = s.split(":")
+            if len(parts) == 2:
+                minutes, seconds = parts
+                return int(minutes) * 60 + float(seconds.replace(",", "."))
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+                return (
+                    int(hours) * 3600
+                    + int(minutes) * 60
+                    + float(seconds.replace(",", "."))
+                )
+        return float(s.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def compute_speed(distance: int | None, swim_time_seconds: float | None) -> float | None:
+    if distance is None or swim_time_seconds is None:
+        return None
+    if distance <= 0 or swim_time_seconds <= 0:
+        return None
+    return round(distance / swim_time_seconds, 4)
+
+
+def swim_year_from_date(swim_date: str | None) -> int | None:
+    if not swim_date:
+        return None
+    try:
+        return datetime.strptime(swim_date[:10], "%Y-%m-%d").year
+    except ValueError:
+        return None
+
+
+def normalize_stroke_code(stroke: str | None) -> str | None:
+    if not stroke:
+        return None
+    key = stroke.strip().upper()
+    return STROKE_ALIASES.get(key, key or None)
 
 
 def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, int]:
@@ -273,8 +350,8 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
                     {
                         "role": "user",
                         "content": (
-                            f"Voici le texte OCR a structurer [{chunk_label}].\n"
-                            "Retourne uniquement un JSON valide conforme au schema demande.\n\n"
+                            f"Voici le texte OCR à structurer [{chunk_label}].\n"
+                            "Retourne uniquement un JSON valide conforme au schéma demandé.\n\n"
                             f"TEXTE:\n{current_text}"
                         ),
                     },
@@ -302,7 +379,7 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
                         retry_after = int(float(retry_header)) + 2
                     except ValueError:
                         pass
-            print(f"  [429 RPM] {chunk_label} -> attente {retry_after:.0f}s...")
+            print(f"  [429 RPM] {chunk_label} → attente {retry_after:.0f}s...")
             time.sleep(retry_after)
             continue
 
@@ -320,9 +397,8 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
                     or "forbidden" in message
                 ):
                     raise FatalGroqError(
-                        "Acces Groq refuse par le compte/organisation "
-                        "(organization_restricted ou erreur d'authentification). "
-                        "Verifier la cle API et l'etat du compte Groq."
+                        "Accès Groq refusé (organization_restricted ou authentification). "
+                        "Vérifier la clé API et l'état du compte Groq."
                     ) from exc
 
             if code == 413:
@@ -330,19 +406,19 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
                 if new_size < len(current_text) and new_size >= MIN_CHUNK_CHARS:
                     print(
                         f"  [413 TPM] {chunk_label} : {len(current_text)} chars trop grand "
-                        f"-> reduit a {new_size} chars, attente {INTER_REQUEST_SLEEP:.0f}s..."
+                        f"→ réduit à {new_size} chars, attente {INTER_REQUEST_SLEEP:.0f}s..."
                     )
                     current_text = current_text[:new_size]
                     time.sleep(INTER_REQUEST_SLEEP)
                     continue
                 raise RuntimeError(
-                    f"{chunk_label} : chunk a {len(current_text)} chars encore trop grand."
+                    f"{chunk_label} : chunk à {len(current_text)} chars encore trop grand."
                 ) from exc
 
             transient = code in (500, 502, 503, 504) or "timeout" in str(exc).lower()
             if transient and attempt < NETWORK_MAX_RETRIES:
                 wait_time = NETWORK_BACKOFF_BASE ** attempt
-                print(f"  [retry {code}] {chunk_label} -> retry dans {wait_time}s...")
+                print(f"  [retry {code}] {chunk_label} → retry dans {wait_time}s...")
                 time.sleep(wait_time)
                 continue
 
@@ -351,7 +427,7 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
         except APIConnectionError as exc:
             if attempt < NETWORK_MAX_RETRIES:
                 wait_time = NETWORK_BACKOFF_BASE ** attempt
-                print(f"  [connexion] {chunk_label} -> retry dans {wait_time}s...")
+                print(f"  [connexion] {chunk_label} → retry dans {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             raise RuntimeError(f"Connexion impossible ({chunk_label}) : {exc}") from exc
@@ -359,66 +435,155 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
         except Exception as exc:
             raise RuntimeError(f"Erreur inattendue ({chunk_label}) : {exc}") from exc
 
-    raise RuntimeError(f"Echec apres {NETWORK_MAX_RETRIES} tentatives ({chunk_label})")
+    raise RuntimeError(f"Échec après {NETWORK_MAX_RETRIES} tentatives ({chunk_label})")
 
 
-def pick_value(row: dict[str, Any], aliases: tuple[str, ...]) -> str:
-    for alias in aliases:
-        value = row.get(alias)
-        if value is None:
-            continue
-        clean = str(value).strip()
-        if clean:
-            return clean
-    return ""
+def _null_or_str(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value).strip() or None
 
 
-def normalize_rows(raw_rows: Any) -> list[dict[str, str]]:
-    if not isinstance(raw_rows, list):
-        return []
-
-    rows_out: list[dict[str, str]] = []
-    for row in raw_rows:
-        if not isinstance(row, dict):
-            continue
-
-        normalized_row = {
-            header: pick_value(row, FIELD_ALIASES[header])
-            for header in DEFAULT_HEADERS
-        }
-        if any(normalized_row.values()):
-            rows_out.append(normalized_row)
-
-    return rows_out
+def _null_or_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def normalize_output(raw: Any, source_file: str) -> dict[str, Any]:
-    tables_in = raw.get("tables", []) if isinstance(raw, dict) else []
-    tables_out = []
+def _null_or_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-    for table in tables_in if isinstance(tables_in, list) else []:
-        if not isinstance(table, dict):
-            continue
 
-        category = normalize_category(table.get("category"))
-        if category not in VALID_CATEGORIES:
-            continue
-
-        rows = normalize_rows(table.get("rows"))
-        if not rows:
-            continue
-
-        tables_out.append(
-            {
-                "category": category,
-                "headers": DEFAULT_HEADERS[:],
-                "rows": rows,
-            }
+def normalize_swimmer(raw: Any, swim_year: int | None) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    year_of_birth = _null_or_int(raw.get("Year_of_birth"))
+    age = _null_or_int(raw.get("Age"))
+    if age is None:
+        age = _null_or_int(raw.get("Age_at_Performance"))
+    if age is None and swim_year is not None and year_of_birth is not None:
+        age = swim_year - year_of_birth
+    gender = _null_or_str(raw.get("Gender"))
+    if gender:
+        g = gender.upper()
+        gender = "F" if g in {"F", "FEMME", "DAMES", "FEMININ", "FÉMININ"} else (
+            "M" if g in {"M", "HOMME", "MESSIEURS", "MASCULIN"} else gender
         )
-
     return {
-        "source_file": source_file,
-        "tables": tables_out,
+        "Name": _null_or_str(raw.get("Name")),
+        "Gender": gender,
+        "Year_of_birth": year_of_birth,
+        "Age": age,
+        "Nationality": _null_or_str(raw.get("Nationality")),
+    }
+
+
+def normalize_status(swim_time: str | None, status: str | None) -> str:
+    if status:
+        s = status.strip().upper()
+        if s in {"OK", "NC", "DSQ", "DNF", "DNS"}:
+            return s
+        if s in {"DQ", "DISQ"}:
+            return "DSQ"
+    time_l = (swim_time or "").strip().lower()
+    if "dsq" in time_l or "disqual" in time_l:
+        return "DSQ"
+    if "abandon" in time_l:
+        return "DNF"
+    if "frf n.d" in time_l or time_l in {"n.d.", "-"}:
+        return "DNS"
+    return "OK"
+
+
+def normalize_performance(
+    raw: Any,
+    swim_year: int | None,
+    distance: int | None,
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    swim_time = _null_or_str(raw.get("SwimTime"))
+    swim_secs = _null_or_float(raw.get("SwimTimeSeconds"))
+    if swim_secs is None:
+        swim_secs = parse_swim_time_seconds(swim_time)
+    rank = _null_or_int(raw.get("Rank"))
+    status = normalize_status(swim_time, _null_or_str(raw.get("Status")))
+    speed = _null_or_float(raw.get("Speed"))
+    if speed is None:
+        speed = compute_speed(distance, swim_secs)
+    return {
+        "Rank": rank,
+        "club": _null_or_str(raw.get("club")),
+        "SwimTime": swim_time,
+        "SwimTimeSeconds": swim_secs,
+        "Status": status,
+        "Speed": speed,
+        "swimmer": normalize_swimmer(raw.get("swimmer"), swim_year),
+    }
+
+
+def normalize_epreuve(raw: Any, swim_year: int | None) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    event = _null_or_str(raw.get("Event"))
+    if not event:
+        return None
+    distance = _null_or_int(raw.get("Distance"))
+    course = _null_or_str(raw.get("Course")) or "SCM"
+    pool_length = _null_or_int(raw.get("PoolLength"))
+    if pool_length is None:
+        pool_length = 25 if course == "SCM" else 50
+    stroke = normalize_stroke_code(_null_or_str(raw.get("Stroke")))
+    perfs_in = raw.get("performances", [])
+    performances = [
+        normalize_performance(p, swim_year, distance)
+        for p in (perfs_in if isinstance(perfs_in, list) else [])
+        if isinstance(p, dict)
+    ]
+    return {
+        "Event": event,
+        "Distance": distance,
+        "Stroke": stroke,
+        "Course": course,
+        "PoolLength": pool_length,
+        "tour": _null_or_str(raw.get("tour")) or "",
+        "performances": performances,
+    }
+
+
+def normalize_output(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    swim_date = _null_or_str(raw.get("SwimDate"))
+    swim_year = _null_or_int(raw.get("SwimYear"))
+    if swim_year is None:
+        swim_year = swim_year_from_date(swim_date)
+    country = _null_or_str(raw.get("Country")) or "MAR"
+    location = raw.get("location")
+    if location is None:
+        location = ""
+    else:
+        location = str(location).strip()
+    epreuves_out: list[dict[str, Any]] = []
+    for ep in raw.get("epreuves", []) if isinstance(raw.get("epreuves"), list) else []:
+        normalized = normalize_epreuve(ep, swim_year)
+        if normalized is not None:
+            epreuves_out.append(normalized)
+    return {
+        "SwimDate": swim_date,
+        "SwimYear": swim_year,
+        "Meet": _null_or_str(raw.get("Meet")) or "",
+        "location": location,
+        "Country": country,
+        "epreuves": epreuves_out,
     }
 
 
@@ -437,16 +602,16 @@ def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[st
 
     if DEBUG:
         print(
-            f"  [debug] {len(text)} chars -> {nb_chunks} chunk(s) "
+            f"  [debug] {len(text)} chars → {nb_chunks} chunk(s) "
             f"de ~{INITIAL_CHUNK_CHARS} chars max"
         )
     elif nb_chunks > 1:
         print(
-            f"  -> {nb_chunks} chunks ({len(text)} chars), "
-            f"duree estimee ~{(nb_chunks - 1) * INTER_REQUEST_SLEEP:.0f}s d'attente"
+            f"  → {nb_chunks} chunks ({len(text)} chars), "
+            f"durée estimée ~{(nb_chunks - 1) * INTER_REQUEST_SLEEP:.0f}s d'attente"
         )
 
-    all_tables: list[list[dict[str, Any]]] = []
+    all_parsed: list[dict] = []
     total_tokens = 0
     nb_requests = 0
 
@@ -458,7 +623,7 @@ def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[st
             break
 
         if idx > 1:
-            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] fenetre TPM avant {label}...")
+            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] fenêtre TPM avant {label}...")
             time.sleep(INTER_REQUEST_SLEEP)
 
         try:
@@ -472,7 +637,7 @@ def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[st
                 str(exc),
                 encoding="utf-8",
             )
-            print(f"  X {label} erreur : {exc}")
+            print(f"  ✗ {label} erreur : {exc}")
             nb_requests += 1
             continue
 
@@ -487,21 +652,22 @@ def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[st
                 encoding="utf-8",
             )
             if DEBUG:
-                print(f"  [debug] {label} reponse non JSON -> sauvegardee dans errors/")
+                print(f"  [debug] {label} réponse non-JSON → sauvegardée dans errors/")
             continue
 
-        tables = parsed.get("tables", []) if isinstance(parsed, dict) else []
-        if isinstance(tables, list):
-            all_tables.append(tables)
+        all_parsed.append(parsed if isinstance(parsed, dict) else {})
 
-    if not all_tables:
-        return "Aucun chunk traite avec succes -> voir errors/", total_tokens, nb_requests
+    if not all_parsed:
+        return "Aucun chunk traité avec succès → voir errors/", total_tokens, nb_requests
 
-    source_file = infer_source_filename(file_path.name, payload)
-    merged_tables = merge_tables(all_tables)
-    output = normalize_output({"tables": merged_tables}, source_file)
-    if not output["tables"]:
-        return "Aucune table valide extraite apres normalisation.", total_tokens, nb_requests
+    all_epreuves = [
+        p.get("epreuves", [])
+        for p in all_parsed
+        if isinstance(p.get("epreuves"), list)
+    ]
+    metadata = merge_metadata(all_parsed)
+    merged_epreuves = merge_epreuves(all_epreuves)
+    output = normalize_output({**metadata, "epreuves": merged_epreuves})
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUTPUT_DIR / file_path.name).write_text(
@@ -511,11 +677,36 @@ def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[st
     return "OK", total_tokens, nb_requests
 
 
+def resolve_input_file(name_or_path: str) -> Path:
+    candidate = Path(name_or_path).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+    in_dir = INPUT_DIR / name_or_path
+    if in_dir.is_file():
+        return in_dir.resolve()
+    if not name_or_path.endswith(".json"):
+        in_dir = INPUT_DIR / f"{name_or_path}.json"
+        if in_dir.is_file():
+            return in_dir.resolve()
+    raise FileNotFoundError(
+        f"Fichier introuvable : {name_or_path!r} (cherché dans {INPUT_DIR})"
+    )
+
+
 def main() -> int:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    parser = argparse.ArgumentParser(
+        description="Structure les JSON actualités FRMN au format html_results.",
+    )
+    parser.add_argument(
+        "--file", "-f",
+        metavar="NOM_OU_CHEMIN",
+        help="Traiter un seul fichier (nom dans le dossier 2016 ou chemin).",
+    )
+    args = parser.parse_args()
+
+    api_key = get_groq_api_key()
     if not api_key:
-        print("[erreur] GROQ_API_KEY manquante.")
-        print("         export GROQ_API_KEY='gsk_...'")
+        print(f"[erreur] {GROQ_API_KEY_ENV} manquante dans processing/.env")
         return 1
 
     if not INPUT_DIR.is_dir():
@@ -525,44 +716,49 @@ def main() -> int:
     logger = setup_logger(LOG_FILE)
     client = Groq(api_key=api_key)
 
+    single_file = bool(args.file)
+    update_progress = not single_file
+
     progress = load_progress(PROGRESS_FILE)
     maybe_reset_daily_quota(progress)
 
     processed = set(progress.get("processed_files", []))
     requests_today = int(progress.get("requests_today", 0))
-    all_files = sorted(path for path in INPUT_DIR.glob("*.json") if path.is_file())
-    already_in_output = (
-        {path.name for path in OUTPUT_DIR.glob("*.json")}
-        if OUTPUT_DIR.is_dir()
-        else set()
-    )
-    pending = [
-        file_path
-        for file_path in all_files
-        if file_path.name not in processed and file_path.name not in already_in_output
-    ]
 
-    skipped = len(already_in_output.intersection({path.name for path in all_files}))
-    if skipped:
-        print(
-            f"[info] {skipped} fichier(s) ignores car deja presents "
-            "dans le dossier de sortie."
+    if single_file:
+        try:
+            file_path = resolve_input_file(args.file)
+        except FileNotFoundError as exc:
+            print(f"[erreur] {exc}")
+            return 1
+        pending = [file_path]
+        print(f"[test] Fichier unique : {file_path.name}")
+    else:
+        all_files = sorted(path for path in INPUT_DIR.glob("*.json") if path.is_file())
+        already_in_output = (
+            {path.name for path in OUTPUT_DIR.glob("*.json")}
+            if OUTPUT_DIR.is_dir()
+            else set()
         )
-
-    if not pending:
-        print("[info] Tous les fichiers sont deja traites. Rien a faire.")
-        return 0
+        pending = [
+            file_path
+            for file_path in all_files
+            if file_path.name not in processed and file_path.name not in already_in_output
+        ]
+        skipped = len(already_in_output.intersection({path.name for path in all_files}))
+        if skipped:
+            print(f"[info] {skipped} fichier(s) ignorés (déjà en sortie).")
+        if not pending:
+            print("[info] Tous les fichiers sont déjà traités.")
+            print("       Astuce : --file NOM.json pour un test unitaire.")
+            return 0
 
     print("=" * 60)
-    print(f"  Modele               : {MODEL}")
-    print(f"  Dossier source       : {INPUT_DIR}")
-    print(f"  Dossier sortie       : {OUTPUT_DIR}")
-    print(f"  Chunk max            : {INITIAL_CHUNK_CHARS} chars")
-    print(f"  Pause entre appels   : {INTER_REQUEST_SLEEP:.0f}s")
-    print(f"  Fichiers total       : {len(all_files)}")
-    print(f"  Deja traites         : {len(processed)}")
-    print(f"  A traiter            : {len(pending)}")
-    print(f"  Requetes aujourd'hui : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
+    print(f"  Modèle               : {MODEL}")
+    print(f"  Source               : {INPUT_DIR}")
+    print(f"  Sortie               : {OUTPUT_DIR}")
+    print(f"  À traiter            : {len(pending)}")
+    print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
     print("=" * 60)
 
     ok_count = 0
@@ -570,19 +766,13 @@ def main() -> int:
 
     for index, file_path in enumerate(pending, start=1):
         if requests_today >= DAILY_REQUEST_THRESHOLD:
-            print(
-                f"\n[stop] Quota journalier atteint ({requests_today} requetes). "
-                f"Relance demain - {len(pending) - index + 1} fichier(s) restants."
-            )
+            print(f"\n[stop] Quota journalier atteint ({requests_today} requêtes).")
             break
 
         print(f"\n[{index}/{len(pending)}] {file_path.name}")
 
         if index > 1:
-            print(
-                f"  [attente {INTER_REQUEST_SLEEP:.0f}s] "
-                "fenetre TPM entre fichiers..."
-            )
+            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] entre fichiers...")
             time.sleep(INTER_REQUEST_SLEEP)
 
         status = "ERREUR"
@@ -597,9 +787,9 @@ def main() -> int:
             )
         except FatalGroqError as exc:
             logger.error("%s | FATAL | %s", file_path.name, exc)
-            save_progress(PROGRESS_FILE, progress)
+            if update_progress:
+                save_progress(PROGRESS_FILE, progress)
             print(f"  FATAL : {exc}")
-            print("[stop] Arret immediat du traitement: erreur Groq permanente.")
             return 1
         except Exception as exc:
             status = f"Exception : {exc}"
@@ -610,37 +800,34 @@ def main() -> int:
 
         if status == "OK":
             ok_count += 1
-            processed.add(file_path.name)
-            progress["processed_files"] = sorted(processed)
+            out_path = OUTPUT_DIR / file_path.name
+            print(f"  ✓ OK | {used_tokens} tokens | écrit : {out_path}")
+            if update_progress:
+                processed.add(file_path.name)
+                progress["processed_files"] = sorted(processed)
             logger.info(
                 "%s | OK | tokens=%d | req_total=%d",
                 file_path.name,
                 used_tokens,
                 requests_today,
             )
-            print(
-                f"  OK | {used_tokens} tokens | "
-                f"requetes aujourd'hui : {requests_today}/{DAILY_REQUEST_THRESHOLD}"
-            )
         else:
             err_count += 1
             logger.error("%s | ERREUR | %s", file_path.name, status)
-            print(f"  ERREUR : {status}")
+            print(f"  ✗ ERREUR : {status}")
 
-        save_progress(PROGRESS_FILE, progress)
+        if update_progress:
+            save_progress(PROGRESS_FILE, progress)
 
-    remaining = len(pending) - ok_count - err_count
     print("\n" + "=" * 60)
-    print(f"  OK                  : {ok_count}")
-    print(f"  Erreurs             : {err_count}")
-    if remaining > 0:
-        print(f"  Non traites         : {remaining} (quota atteint)")
-    print(f"  Requetes aujourd'hui : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
-    print(f"  Total traites       : {len(processed)} / {len(all_files)}")
+    print(f"  ✓ Succès  : {ok_count}")
+    print(f"  ✗ Erreurs : {err_count}")
+    print(f"  Requêtes  : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
     print("=" * 60)
 
-    save_progress(PROGRESS_FILE, progress)
-    return 0
+    if update_progress:
+        save_progress(PROGRESS_FILE, progress)
+    return 0 if err_count == 0 else 1
 
 
 if __name__ == "__main__":

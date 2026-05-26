@@ -3,4 +3,12 @@ data/json_structures/
 __pycache__/
 processing/progress_groq.json
 processing/processing_groq.log
-extractors/.env
+processing/progress_deepseek.json
+processing/processing_deepseek.log
+processing/errors_deepseek/
+processing/progress_ollama.json
+processing/processing_ollama.log
+processing/errors_ollama/
+processing/.env
+
+
