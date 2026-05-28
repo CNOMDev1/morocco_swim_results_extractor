@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,62 @@ DEFAULT_PROGRESS: dict[str, Any] = {
     "last_reset_date": "",
     "processed_files": [],
 }
+
+
+def mask_api_key(api_key: str) -> str:
+    if len(api_key) <= 10:
+        return "***"
+    return f"{api_key[:6]}...{api_key[-4:]}"
+
+
+class GroqClientPool:
+    """Pool de clients Groq avec rotation de clé API."""
+
+    def __init__(self, api_keys: list[str]) -> None:
+        if not api_keys:
+            raise ValueError("Au moins une clé API Groq est requise.")
+        deduped = list(dict.fromkeys(k.strip() for k in api_keys if k.strip()))
+        if not deduped:
+            raise ValueError("Aucune clé API Groq valide.")
+        self._keys = deduped
+        self._clients = [Groq(api_key=k) for k in self._keys]
+        self._order: deque[int] = deque(range(len(self._clients)))
+
+    @property
+    def size(self) -> int:
+        return len(self._clients)
+
+    @property
+    def current_index(self) -> int:
+        return self._order[0]
+
+    @property
+    def current_client(self) -> Groq:
+        return self._clients[self.current_index]
+
+    @property
+    def current_key_masked(self) -> str:
+        return mask_api_key(self._keys[self.current_index])
+
+    def rotate(self) -> None:
+        self._order.rotate(-1)
+
+
+def load_groq_api_keys() -> list[str]:
+    """
+    Charge jusqu'à 5 clés API Groq depuis :
+    - GROQ_API_KEYS="k1,k2,k3,..."
+    - GROQ_API_KEY + GROQ_API_KEY_2 ... GROQ_API_KEY_5
+    """
+    keys: list[str] = []
+    csv_keys = os.getenv("GROQ_API_KEYS", "").strip()
+    if csv_keys:
+        keys.extend([k.strip() for k in csv_keys.split(",") if k.strip()])
+    for env_name in ("GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3", "GROQ_API_KEY_4", "GROQ_API_KEY_5"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            keys.append(value)
+    return list(dict.fromkeys(keys))[:5]
 
 
 def setup_logger(log_path: Path) -> logging.Logger:
@@ -320,7 +377,7 @@ def normalize_stroke_code(stroke: str | None) -> str | None:
 
 
 def call_groq_chunk(
-    client:      Groq,
+    client_pool: GroqClientPool,
     chunk:       str,
     chunk_label: str,
 ) -> tuple[str, int]:
@@ -334,6 +391,7 @@ def call_groq_chunk(
     current_text = chunk
 
     for attempt in range(1, NETWORK_MAX_RETRIES + 1):
+        client = client_pool.current_client
         try:
             if DEBUG:
                 print(f"  [debug] {chunk_label} tentative {attempt} "
@@ -363,6 +421,12 @@ def call_groq_chunk(
             return text_out, total_tok
 
         except RateLimitError as exc:
+            if client_pool.size > 1:
+                previous = client_pool.current_key_masked
+                client_pool.rotate()
+                print(f"  [429 RPM] {chunk_label} clé {previous} limitée → bascule vers {client_pool.current_key_masked}")
+                continue
+
             retry_after = RATE_LIMIT_SLEEP
             resp = getattr(exc, "response", None)
             if resp is not None:
@@ -378,6 +442,12 @@ def call_groq_chunk(
 
         except APIStatusError as exc:
             code = exc.status_code
+
+            if code == 429 and client_pool.size > 1:
+                previous = client_pool.current_key_masked
+                client_pool.rotate()
+                print(f"  [429 API] {chunk_label} clé {previous} limitée → bascule vers {client_pool.current_key_masked}")
+                continue
 
             if code == 413:
                 new_size = max(len(current_text) // 2, MIN_CHUNK_CHARS)
@@ -566,7 +636,7 @@ def normalize_output(raw: Any) -> dict[str, Any]:
 
 def process_file(
     file_path:      Path,
-    client:         Groq,
+    client_pool:    GroqClientPool,
     requests_today: int,
 ) -> tuple[str, int, int]:
     """Retourne (status, tokens_utilisés, nb_requêtes_effectuées)."""
@@ -604,7 +674,7 @@ def process_file(
             time.sleep(INTER_REQUEST_SLEEP)
 
         try:
-            raw_response, used_tokens = call_groq_chunk(client, chunk, label)
+            raw_response, used_tokens = call_groq_chunk(client_pool, chunk, label)
             nb_requests += 1
         except RuntimeError as exc:
             ERRORS_DIR.mkdir(parents=True, exist_ok=True)
@@ -683,10 +753,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        print("[erreur] GROQ_API_KEY manquante.")
-        print("         export GROQ_API_KEY='gsk_...'")
+    api_keys = load_groq_api_keys()
+    if not api_keys:
+        print("[erreur] Aucune clé Groq trouvée.")
+        print("         Définis GROQ_API_KEY ou GROQ_API_KEYS,")
+        print("         ou GROQ_API_KEY_2 ... GROQ_API_KEY_5.")
         return 1
 
     if not INPUT_DIR.is_dir():
@@ -694,7 +765,7 @@ def main() -> int:
         return 1
 
     logger = setup_logger(LOG_FILE)
-    client = Groq(api_key=api_key)
+    client_pool = GroqClientPool(api_keys)
 
     single_file = bool(args.file)
     update_progress = not single_file
@@ -720,13 +791,32 @@ def main() -> int:
         already_in_output = (
             {p.name for p in OUTPUT_DIR.glob("*.json")} if OUTPUT_DIR.is_dir() else set()
         )
-        pending = [
-            f for f in all_files
-            if f.name not in processed and f.name not in already_in_output
-        ]
-        skipped = len(already_in_output.intersection({f.name for f in all_files}))
-        if skipped:
-            print(f"[info] {skipped} fichier(s) ignorés car déjà présents dans le dossier de sortie.")
+        all_file_names = {f.name for f in all_files}
+        treated_union = (processed | already_in_output).intersection(all_file_names)
+        pending: list[Path] = []
+        skipped_progress = 0
+        skipped_output = 0
+        for f in all_files:
+            in_progress = f.name in processed
+            in_output = f.name in already_in_output
+            if in_progress or in_output:
+                reasons: list[str] = []
+                if in_progress:
+                    skipped_progress += 1
+                    reasons.append("progress")
+                if in_output:
+                    skipped_output += 1
+                    reasons.append("already_in_output")
+                print(f"[skip] {f.name} ({', '.join(reasons)})")
+                continue
+            pending.append(f)
+        if skipped_progress or skipped_output:
+            print(
+                "[info] Ignorés : "
+                f"{skipped_progress} via progress, "
+                f"{skipped_output} déjà en sortie."
+            )
+        print(f"[info] Restants non traités : {len(pending)}")
         if not pending:
             print("[info] Tous les fichiers sont déjà traités. Rien à faire.")
             print("       Astuce : python processing/groq_structuration.py --file NOM.json --force")
@@ -734,11 +824,13 @@ def main() -> int:
 
     print("=" * 60)
     print(f"  Modèle               : {MODEL}")
+    print(f"  Clés Groq actives    : {client_pool.size}")
+    print(f"  Clé courante         : {client_pool.current_key_masked}")
     print(f"  Chunk max            : {INITIAL_CHUNK_CHARS} chars")
     print(f"  Pause entre appels   : {INTER_REQUEST_SLEEP:.0f}s")
-    print(f"  À traiter            : {len(pending)}")
+    print(f"  Fichiers restants    : {len(pending)}")
     if not single_file:
-        print(f"  Déjà traités         : {len(processed)}")
+        print(f"  Déjà traités         : {len(treated_union)}")
     print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
     print(f"  Sortie               : {OUTPUT_DIR}")
     print("=" * 60)
@@ -765,7 +857,7 @@ def main() -> int:
         try:
             status, used_tokens, nb_req = process_file(
                 file_path      = file_path,
-                client         = client,
+                client_pool    = client_pool,
                 requests_today = requests_today,
             )
         except Exception as exc:

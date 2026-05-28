@@ -740,14 +740,32 @@ def main() -> int:
             if OUTPUT_DIR.is_dir()
             else set()
         )
-        pending = [
-            file_path
-            for file_path in all_files
-            if file_path.name not in processed and file_path.name not in already_in_output
-        ]
-        skipped = len(already_in_output.intersection({path.name for path in all_files}))
-        if skipped:
-            print(f"[info] {skipped} fichier(s) ignorés (déjà en sortie).")
+        all_file_names = {path.name for path in all_files}
+        treated_union = (processed | already_in_output).intersection(all_file_names)
+        pending: list[Path] = []
+        skipped_progress = 0
+        skipped_output = 0
+        for file_path in all_files:
+            in_progress = file_path.name in processed
+            in_output = file_path.name in already_in_output
+            if in_progress or in_output:
+                reasons: list[str] = []
+                if in_progress:
+                    skipped_progress += 1
+                    reasons.append("progress")
+                if in_output:
+                    skipped_output += 1
+                    reasons.append("already_in_output")
+                print(f"[skip] {file_path.name} ({', '.join(reasons)})")
+                continue
+            pending.append(file_path)
+        if skipped_progress or skipped_output:
+            print(
+                "[info] Ignorés : "
+                f"{skipped_progress} via progress, "
+                f"{skipped_output} déjà en sortie."
+            )
+        print(f"[info] Restants non traités : {len(pending)}")
         if not pending:
             print("[info] Tous les fichiers sont déjà traités.")
             print("       Astuce : --file NOM.json pour un test unitaire.")
@@ -757,7 +775,9 @@ def main() -> int:
     print(f"  Modèle               : {MODEL}")
     print(f"  Source               : {INPUT_DIR}")
     print(f"  Sortie               : {OUTPUT_DIR}")
-    print(f"  À traiter            : {len(pending)}")
+    print(f"  Fichiers restants    : {len(pending)}")
+    if not single_file:
+        print(f"  Déjà traités         : {len(treated_union)}")
     print(f"  Requêtes aujourd'hui : {requests_today} / {DAILY_REQUEST_THRESHOLD}")
     print("=" * 60)
 
