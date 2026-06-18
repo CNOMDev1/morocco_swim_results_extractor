@@ -12,29 +12,32 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
+import anthropic
+from anthropic import RateLimitError, APIStatusError, APIConnectionError
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-MODEL = "llama-3.1-8b-instant"
+MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+MAX_OUTPUT_TOKENS = int(os.getenv("CLAUDE_MAX_OUTPUT_TOKENS", "64000"))
 
 SCRIPT_DIR    = Path(__file__).resolve().parent
 BASE_DIR      = SCRIPT_DIR.parent
-INPUT_DIR     = BASE_DIR / "data" / "json_from_pdfs" / "pdfs_results"
-OUTPUT_DIR    = BASE_DIR / "data" / "json_structures" / "json_update"
-PROGRESS_FILE = SCRIPT_DIR / "progress_groq.json"
-ERRORS_DIR    = SCRIPT_DIR / "errors"
-LOG_FILE      = SCRIPT_DIR / "processing_groq.log"
+INPUT_DIR     = BASE_DIR / "data" / "json_from_pdfs" / "pdfs_results_actualites" / "2017"
+OUTPUT_DIR    = BASE_DIR / "data" / "json_structures" / "results_from_actualites" / "2017"
+PROGRESS_FILE = SCRIPT_DIR / "progress_claude_actualites_2017.json"
+ERRORS_DIR    = SCRIPT_DIR / "errors_claude_actualites"
+LOG_FILE      = SCRIPT_DIR / "processing_claude_actualites_2017.log"
 
-DAILY_REQUEST_THRESHOLD = 14_000
-INTER_REQUEST_SLEEP     = 62.0
-RATE_LIMIT_SLEEP        = 65.0
+DAILY_REQUEST_THRESHOLD = 5_000
+INTER_REQUEST_SLEEP     = 1.0
+RATE_LIMIT_SLEEP        = 60.0
 NETWORK_MAX_RETRIES     = 5
 NETWORK_BACKOFF_BASE    = 2
 
-INITIAL_CHUNK_CHARS = 12_000
-MIN_CHUNK_CHARS     = 3_000
+INITIAL_CHUNK_CHARS = int(os.getenv("CLAUDE_CHUNK_CHARS", "6000"))
+MIN_CHUNK_CHARS     = 2_000
+MAX_CHUNK_SPLIT_DEPTH = 4
 
 DEBUG = False
 
@@ -96,10 +99,6 @@ STROKE_ALIASES: dict[str, str] = {
     "RELAIS": "REL",
 }
 
-AGE_CATEGORIES = (
-    "SENIORS", "JUNIORS", "CADETS", "MINIMES", "BENJAMINS", "POUSSINS",
-)
-
 SYSTEM_PROMPT = """Tu es un extracteur de résultats de natation FRMN (PDF OCR).
 Analyse le texte fourni et retourne UNIQUEMENT un objet JSON valide, sans markdown, sans backticks, sans explication.
 
@@ -149,17 +148,17 @@ def mask_api_key(api_key: str) -> str:
     return f"{api_key[:6]}...{api_key[-4:]}"
 
 
-class GroqClientPool:
-    """Pool de clients Groq avec rotation de clé API."""
+class ClaudeClientPool:
+    """Pool de clients Anthropic avec rotation de clé API."""
 
     def __init__(self, api_keys: list[str]) -> None:
         if not api_keys:
-            raise ValueError("Au moins une clé API Groq est requise.")
+            raise ValueError("Au moins une clé API Anthropic est requise.")
         deduped = list(dict.fromkeys(k.strip() for k in api_keys if k.strip()))
         if not deduped:
-            raise ValueError("Aucune clé API Groq valide.")
+            raise ValueError("Aucune clé API Anthropic valide.")
         self._keys = deduped
-        self._clients = [Groq(api_key=k) for k in self._keys]
+        self._clients = [anthropic.Anthropic(api_key=k) for k in self._keys]
         self._order: deque[int] = deque(range(len(self._clients)))
 
     @property
@@ -171,7 +170,7 @@ class GroqClientPool:
         return self._order[0]
 
     @property
-    def current_client(self) -> Groq:
+    def current_client(self) -> anthropic.Anthropic:
         return self._clients[self.current_index]
 
     @property
@@ -182,17 +181,23 @@ class GroqClientPool:
         self._order.rotate(-1)
 
 
-def load_groq_api_keys() -> list[str]:
+def load_claude_api_keys() -> list[str]:
     """
-    Charge jusqu'à 5 clés API Groq depuis :
-    - GROQ_API_KEYS="k1,k2,k3,..."
-    - GROQ_API_KEY + GROQ_API_KEY_2 ... GROQ_API_KEY_5
+    Charge jusqu'à 5 clés API Anthropic depuis :
+    - ANTHROPIC_API_KEYS="k1,k2,k3,..."
+    - ANTHROPIC_API_KEY + ANTHROPIC_API_KEY_2 ... ANTHROPIC_API_KEY_5
     """
     keys: list[str] = []
-    csv_keys = os.getenv("GROQ_API_KEYS", "").strip()
+    csv_keys = os.getenv("ANTHROPIC_API_KEYS", "").strip()
     if csv_keys:
         keys.extend([k.strip() for k in csv_keys.split(",") if k.strip()])
-    for env_name in ("GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3", "GROQ_API_KEY_4", "GROQ_API_KEY_5"):
+    for env_name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_API_KEY_2",
+        "ANTHROPIC_API_KEY_3",
+        "ANTHROPIC_API_KEY_4",
+        "ANTHROPIC_API_KEY_5",
+    ):
         value = os.getenv(env_name, "").strip()
         if value:
             keys.append(value)
@@ -201,7 +206,7 @@ def load_groq_api_keys() -> list[str]:
 
 def setup_logger(log_path: Path) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("groq_structuration")
+    logger = logging.getLogger("claude_structuration")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     h = logging.FileHandler(log_path, encoding="utf-8")
@@ -298,12 +303,12 @@ def merge_epreuves(all_epreuves: list[list[dict]]) -> list[dict]:
             key = _epreuve_key(ep)
             if key not in merged:
                 merged[key] = {
-                    "Event":      ep.get("Event"),
-                    "Distance":   ep.get("Distance"),
-                    "Stroke":     ep.get("Stroke"),
-                    "Course":     ep.get("Course"),
-                    "PoolLength": ep.get("PoolLength"),
-                    "tour":       ep.get("tour"),
+                    "Event":        ep.get("Event"),
+                    "Distance":     ep.get("Distance"),
+                    "Stroke":       ep.get("Stroke"),
+                    "Course":       ep.get("Course"),
+                    "PoolLength":   ep.get("PoolLength"),
+                    "tour":         ep.get("tour"),
                     "performances": [],
                 }
             perfs = ep.get("performances", [])
@@ -377,17 +382,67 @@ def normalize_stroke_code(stroke: str | None) -> str | None:
     return STROKE_ALIASES.get(key, key or None)
 
 
-def call_groq_chunk(
-    client_pool: GroqClientPool,
+def _extract_json_from_response(text: str) -> str:
+    """Retire d'éventuels blocs markdown autour du JSON."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    return stripped
+
+
+def _usage_tokens(response: anthropic.types.Message) -> int:
+    usage = response.usage
+    if usage is None:
+        return 0
+    return (usage.input_tokens or 0) + (usage.output_tokens or 0)
+
+
+def _claude_messages_params(current_text: str, chunk_label: str) -> dict[str, Any]:
+    return {
+        "model": MODEL,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "system": SYSTEM_PROMPT,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"Voici le texte OCR à structurer [{chunk_label}].\n"
+                    "Retourne uniquement un JSON valide conforme au schéma demandé.\n\n"
+                    f"TEXTE:\n{current_text}"
+                ),
+            }
+        ],
+        "temperature": 0,
+    }
+
+
+def _request_claude_message(
+    client: anthropic.Anthropic,
+    current_text: str,
+    chunk_label: str,
+) -> anthropic.types.Message:
+    """Appel Messages API en streaming (obligatoire si max_tokens élevé / long)."""
+    params = _claude_messages_params(current_text, chunk_label)
+    with client.messages.stream(**params) as stream:
+        return stream.get_final_message()
+
+
+def call_claude_chunk(
+    client_pool: ClaudeClientPool,
     chunk:       str,
     chunk_label: str,
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
     """
-    Envoie un chunk à Groq.
-    - 429 RPM  → attend retry-after puis réessaie
-    - 413 TPM  → réduit le chunk de moitié, attend INTER_REQUEST_SLEEP, réessaie
-    - 5xx      → backoff exponentiel
-    Retourne (réponse_brute, tokens_utilisés).
+    Envoie un chunk à Claude.
+    - 429 → attend puis réessaie ou bascule de clé
+    - 413 / contexte trop long → réduit le chunk de moitié
+    - 5xx → backoff exponentiel
+    Retourne (réponse_brute, tokens_utilisés, stop_reason).
     """
     current_text = chunk
 
@@ -397,35 +452,49 @@ def call_groq_chunk(
             if DEBUG:
                 print(f"  [debug] {chunk_label} tentative {attempt} "
                       f"({len(current_text)} chars)...")
+            else:
+                print(
+                    f"  ⏳ {chunk_label} en cours ({len(current_text)} chars, "
+                    f"max {MAX_OUTPUT_TOKENS} tokens sortie)...",
+                    flush=True,
+                )
 
             t0 = time.perf_counter()
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": (
-                        f"Voici le texte OCR à structurer [{chunk_label}].\n"
-                        "Retourne uniquement un JSON valide conforme au schéma demandé.\n\n"
-                        f"TEXTE:\n{current_text}"
-                    )},
-                ],
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
-            elapsed   = time.perf_counter() - t0
-            text_out  = response.choices[0].message.content or ""
-            total_tok = response.usage.total_tokens if response.usage else 0
+            response = _request_claude_message(client, current_text, chunk_label)
+            elapsed = time.perf_counter() - t0
+
+            text_blocks = [
+                block.text
+                for block in response.content
+                if block.type == "text"
+            ]
+            text_out = _extract_json_from_response("".join(text_blocks))
+            total_tok = _usage_tokens(response)
+
+            stop_reason = getattr(response, "stop_reason", "") or ""
 
             if DEBUG:
-                print(f"  [debug] {chunk_label} ✓ {elapsed:.1f}s | {total_tok} tokens")
+                print(
+                    f"  [debug] {chunk_label} ✓ {elapsed:.1f}s | {total_tok} tokens "
+                    f"| stop={stop_reason}"
+                )
+            else:
+                print(
+                    f"  ✓ {chunk_label} | {elapsed:.0f}s | {total_tok} tokens "
+                    f"| stop={stop_reason}",
+                    flush=True,
+                )
 
-            return text_out, total_tok
+            return text_out, total_tok, stop_reason
 
         except RateLimitError as exc:
             if client_pool.size > 1:
                 previous = client_pool.current_key_masked
                 client_pool.rotate()
-                print(f"  [429 RPM] {chunk_label} clé {previous} limitée → bascule vers {client_pool.current_key_masked}")
+                print(
+                    f"  [429 RPM] {chunk_label} clé {previous} limitée "
+                    f"→ bascule vers {client_pool.current_key_masked}"
+                )
                 continue
 
             retry_after = RATE_LIMIT_SLEEP
@@ -447,14 +516,19 @@ def call_groq_chunk(
             if code == 429 and client_pool.size > 1:
                 previous = client_pool.current_key_masked
                 client_pool.rotate()
-                print(f"  [429 API] {chunk_label} clé {previous} limitée → bascule vers {client_pool.current_key_masked}")
+                print(
+                    f"  [429 API] {chunk_label} clé {previous} limitée "
+                    f"→ bascule vers {client_pool.current_key_masked}"
+                )
                 continue
 
-            if code == 413:
+            if code in (413, 400) and "context" in str(exc).lower():
                 new_size = max(len(current_text) // 2, MIN_CHUNK_CHARS)
                 if new_size < len(current_text) and new_size >= MIN_CHUNK_CHARS:
-                    print(f"  [413 TPM] {chunk_label} : {len(current_text)} chars trop grand "
-                          f"→ réduit à {new_size} chars, attente {INTER_REQUEST_SLEEP:.0f}s...")
+                    print(
+                        f"  [contexte] {chunk_label} : {len(current_text)} chars trop grand "
+                        f"→ réduit à {new_size} chars, attente {INTER_REQUEST_SLEEP:.0f}s..."
+                    )
                     current_text = current_text[:new_size]
                     time.sleep(INTER_REQUEST_SLEEP)
                     continue
@@ -462,14 +536,14 @@ def call_groq_chunk(
                     f"{chunk_label} : chunk à {len(current_text)} chars encore trop grand."
                 ) from exc
 
-            transient = code in (500, 502, 503, 504) or "timeout" in str(exc).lower()
+            transient = code in (500, 502, 503, 504, 529) or "timeout" in str(exc).lower()
             if transient and attempt < NETWORK_MAX_RETRIES:
                 wait = NETWORK_BACKOFF_BASE ** attempt
                 print(f"  [retry {code}] {chunk_label} → retry dans {wait}s...")
                 time.sleep(wait)
                 continue
 
-            raise RuntimeError(f"Groq erreur {code} ({chunk_label}): {exc}") from exc
+            raise RuntimeError(f"Claude erreur {code} ({chunk_label}): {exc}") from exc
 
         except APIConnectionError as exc:
             if attempt < NETWORK_MAX_RETRIES:
@@ -483,6 +557,92 @@ def call_groq_chunk(
             raise RuntimeError(f"Erreur inattendue ({chunk_label}): {exc}") from exc
 
     raise RuntimeError(f"Échec après {NETWORK_MAX_RETRIES} tentatives ({chunk_label})")
+
+
+def _save_chunk_artifact(file_stem: str, chunk_idx: int, kind: str, content: str, part: int = 0) -> Path:
+    ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = f"chunk{chunk_idx}" if part == 0 else f"chunk{chunk_idx}_part{part}"
+    path = ERRORS_DIR / f"{file_stem}_{suffix}_{kind}.txt"
+    path.write_text(content or "", encoding="utf-8")
+    return path
+
+
+def process_text_segment(
+    client_pool: ClaudeClientPool,
+    text:        str,
+    label:       str,
+    file_stem:   str,
+    chunk_idx:   int,
+    depth:       int = 0,
+) -> tuple[list[dict], int, int]:
+    """
+    Appelle Claude sur un segment de texte.
+    Si JSON invalide ou réponse tronquée (max_tokens), découpe en deux et réessaie.
+    Retourne (liste de dicts parsés, tokens, nb_requêtes).
+    """
+    text = text.strip()
+    if not text:
+        return [], 0, 0
+
+    part_label = label if depth == 0 else f"{label} (sous-partie {depth})"
+
+    try:
+        raw_response, used_tokens, stop_reason = call_claude_chunk(
+            client_pool, text, part_label
+        )
+    except RuntimeError as exc:
+        _save_chunk_artifact(file_stem, chunk_idx, "error", str(exc), depth)
+        print(f"  ✗ {part_label} erreur : {exc}")
+        return [], 0, 1
+
+    truncated = stop_reason == "max_tokens"
+
+    try:
+        parsed = json.loads(raw_response)
+        if not isinstance(parsed, dict):
+            parsed = {}
+        if truncated:
+            print(
+                f"  ⚠ {part_label} : réponse tronquée (max_tokens) "
+                f"mais JSON valide — conservé"
+            )
+        return [parsed], used_tokens, 1
+    except json.JSONDecodeError as exc:
+        reason = "tronquée (max_tokens)" if truncated else "JSON invalide"
+        can_split = (
+            depth < MAX_CHUNK_SPLIT_DEPTH
+            and len(text) >= MIN_CHUNK_CHARS * 2
+        )
+        if can_split:
+            mid = len(text) // 2
+            cut = text.rfind("\n", 0, mid)
+            if cut <= 0:
+                cut = mid
+            left, right = text[:cut].strip(), text[cut:].strip()
+            print(
+                f"  ⚠ {part_label} : {reason} ({exc}) "
+                f"→ découpage {len(left)} + {len(right)} chars"
+            )
+            time.sleep(INTER_REQUEST_SLEEP)
+            left_parsed, t_left, q_left = process_text_segment(
+                client_pool, left, label, file_stem, chunk_idx, depth + 1
+            )
+            time.sleep(INTER_REQUEST_SLEEP)
+            right_parsed, t_right, q_right = process_text_segment(
+                client_pool, right, label, file_stem, chunk_idx, depth + 1
+            )
+            return (
+                left_parsed + right_parsed,
+                used_tokens + t_left + t_right,
+                1 + q_left + q_right,
+            )
+
+        _save_chunk_artifact(file_stem, chunk_idx, "invalid", raw_response or "", depth)
+        print(
+            f"  ✗ {part_label} : {reason} — {exc} "
+            f"→ {ERRORS_DIR.name}/"
+        )
+        return [], used_tokens, 1
 
 
 def _null_or_str(value: Any) -> str | None:
@@ -637,7 +797,7 @@ def normalize_output(raw: Any) -> dict[str, Any]:
 
 def process_file(
     file_path:      Path,
-    client_pool:    GroqClientPool,
+    client_pool:    ClaudeClientPool,
     requests_today: int,
 ) -> tuple[str, int, int]:
     """Retourne (status, tokens_utilisés, nb_requêtes_effectuées)."""
@@ -655,9 +815,11 @@ def process_file(
 
     if DEBUG:
         print(f"  [debug] {len(text)} chars → {nb_chunks} chunk(s) de ~{INITIAL_CHUNK_CHARS} chars max")
-    elif nb_chunks > 1:
-        print(f"  → {nb_chunks} chunks ({len(text)} chars), "
-              f"durée estimée ~{(nb_chunks - 1) * INTER_REQUEST_SLEEP:.0f}s d'attente")
+    else:
+        print(
+            f"  → {nb_chunks} chunk(s) ({len(text)} chars) "
+            f"— chaque appel peut prendre plusieurs minutes"
+        )
 
     all_parsed:   list[dict] = []
     total_tokens: int = 0
@@ -671,38 +833,26 @@ def process_file(
             break
 
         if idx > 1:
-            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] fenêtre TPM avant {label}...")
+            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] avant {label}...")
             time.sleep(INTER_REQUEST_SLEEP)
 
-        try:
-            raw_response, used_tokens = call_groq_chunk(client_pool, chunk, label)
-            nb_requests += 1
-        except RuntimeError as exc:
-            ERRORS_DIR.mkdir(parents=True, exist_ok=True)
-            (ERRORS_DIR / f"{file_path.stem}_chunk{idx}_error.txt").write_text(
-                str(exc), encoding="utf-8"
-            )
-            print(f"  ✗ {label} erreur : {exc}")
-            nb_requests += 1
-            continue
-
+        parsed_parts, used_tokens, chunk_requests = process_text_segment(
+            client_pool=client_pool,
+            text=chunk,
+            label=label,
+            file_stem=file_path.stem,
+            chunk_idx=idx,
+        )
         total_tokens += used_tokens
-
-        try:
-            parsed = json.loads(raw_response)
-        except json.JSONDecodeError:
-            ERRORS_DIR.mkdir(parents=True, exist_ok=True)
-            (ERRORS_DIR / f"{file_path.stem}_chunk{idx}_invalid.txt").write_text(
-                raw_response or "", encoding="utf-8"
-            )
-            if DEBUG:
-                print(f"  [debug] {label} réponse non-JSON → sauvegardée dans errors/")
-            continue
-
-        all_parsed.append(parsed if isinstance(parsed, dict) else {})
+        nb_requests += chunk_requests
+        all_parsed.extend(parsed_parts)
 
     if not all_parsed:
-        return "Aucun chunk traité avec succès → voir errors/", total_tokens, nb_requests
+        return (
+            f"Aucun chunk traité avec succès → voir {ERRORS_DIR.name}/",
+            total_tokens,
+            nb_requests,
+        )
 
     all_epreuves = [
         p.get("epreuves", [])
@@ -729,7 +879,7 @@ def process_file_with_api_key(
     Traite un fichier avec une clé API dédiée.
     Retourne (file_name, status, tokens_utilisés, nb_requêtes_effectuées).
     """
-    local_pool = GroqClientPool([api_key])
+    local_pool = ClaudeClientPool([api_key])
     status, used_tokens, nb_req = process_file(
         file_path=file_path,
         client_pool=local_pool,
@@ -758,12 +908,12 @@ def resolve_input_file(name_or_path: str) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Structure les JSON PDF (Groq) au format html_results.",
+        description="Structure les JSON actualités 2017 (Claude) au format html_results.",
     )
     parser.add_argument(
         "--file", "-f",
         metavar="NOM_OU_CHEMIN",
-        help="Traiter un seul fichier (nom dans pdfs_results ou chemin absolu).",
+        help="Traiter un seul fichier (nom dans pdfs_results_actualites/2017 ou chemin).",
     )
     parser.add_argument(
         "--force",
@@ -778,11 +928,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    api_keys = load_groq_api_keys()
+    api_keys = load_claude_api_keys()
     if not api_keys:
-        print("[erreur] Aucune clé Groq trouvée.")
-        print("         Définis GROQ_API_KEY ou GROQ_API_KEYS,")
-        print("         ou GROQ_API_KEY_2 ... GROQ_API_KEY_5.")
+        print("[erreur] Aucune clé Anthropic trouvée.")
+        print("         Définis ANTHROPIC_API_KEY ou ANTHROPIC_API_KEYS,")
+        print("         ou ANTHROPIC_API_KEY_2 ... ANTHROPIC_API_KEY_5.")
         return 1
 
     if not INPUT_DIR.is_dir():
@@ -790,7 +940,7 @@ def main() -> int:
         return 1
 
     logger = setup_logger(LOG_FILE)
-    client_pool = GroqClientPool(api_keys)
+    client_pool = ClaudeClientPool(api_keys)
 
     single_file = bool(args.file)
     update_progress = not single_file
@@ -844,14 +994,15 @@ def main() -> int:
         print(f"[info] Restants non traités : {len(pending)}")
         if not pending:
             print("[info] Tous les fichiers sont déjà traités. Rien à faire.")
-            print("       Astuce : python processing/groq_structuration.py --file NOM.json --force")
+            print("       Astuce : python processing/claude_structuration.py --file NOM.json --force")
             return 0
 
     print("=" * 60)
     print(f"  Modèle               : {MODEL}")
-    print(f"  Clés Groq actives    : {client_pool.size}")
+    print(f"  Clés Claude actives  : {client_pool.size}")
     print(f"  Clé courante         : {client_pool.current_key_masked}")
     print(f"  Chunk max            : {INITIAL_CHUNK_CHARS} chars")
+    print(f"  Max tokens sortie    : {MAX_OUTPUT_TOKENS}")
     print(f"  Pause entre appels   : {INTER_REQUEST_SLEEP:.0f}s")
     print(f"  Fichiers restants    : {len(pending)}")
     if not single_file:
@@ -863,7 +1014,6 @@ def main() -> int:
     ok_count = 0
     err_count = 0
 
-    # Mode fichier unique : comportement historique (séquentiel, une clé active).
     if single_file:
         file_path = pending[0]
         print(f"\n[1/1] {file_path.name}")

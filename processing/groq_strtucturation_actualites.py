@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
 import re
 import time
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -15,15 +17,15 @@ from groq import APIConnectionError, APIStatusError, Groq, RateLimitError
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-# Clé dédiée actualités (processing/.env) ; repli sur GROQ_API_KEY si absente
-GROQ_API_KEY_ENV = "GROQ_API_KEY1"
+# Clés actualités dans processing/.env (GROQ_API_KEY1 … GROQ_API_KEY3)
+GROQ_API_KEY_ENVS = ("GROQ_API_KEY1", "GROQ_API_KEY2", "GROQ_API_KEY3")
 
 MODEL = "llama-3.1-8b-instant"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASE_DIR = SCRIPT_DIR.parent
-INPUT_DIR = BASE_DIR / "data" / "json_from_pdfs" / "pdfs_results_actualites" / "2016"
-OUTPUT_DIR = BASE_DIR / "data" / "json_structures" / "results_from_actualites" / "2016"
+INPUT_DIR = BASE_DIR / "data" / "json_from_pdfs" / "pdfs_results_actualites" / "2026"
+OUTPUT_DIR = BASE_DIR / "data" / "json_structures" / "results_from_actualites" / "2026"
 PROGRESS_FILE = SCRIPT_DIR / "progress_groq_actualites_2016.json"
 ERRORS_DIR = SCRIPT_DIR / "errors_actualites"
 LOG_FILE = SCRIPT_DIR / "processing_groq_actualites_2016.log"
@@ -141,11 +143,53 @@ class FatalGroqError(RuntimeError):
     """Erreur fatale de configuration/acces Groq: inutile de continuer le batch."""
 
 
-def get_groq_api_key() -> str:
-    return (
-        os.getenv(GROQ_API_KEY_ENV, "").strip()
-        or os.getenv("GROQ_API_KEY", "").strip()
-    )
+def mask_api_key(api_key: str) -> str:
+    if len(api_key) <= 10:
+        return "***"
+    return f"{api_key[:6]}...{api_key[-4:]}"
+
+
+class GroqClientPool:
+    """Pool de clients Groq avec rotation circulaire sur les clés."""
+
+    def __init__(self, api_keys: list[str]) -> None:
+        if not api_keys:
+            raise ValueError("Au moins une clé API Groq est requise.")
+        deduped = list(dict.fromkeys(k.strip() for k in api_keys if k.strip()))
+        if not deduped:
+            raise ValueError("Aucune clé API Groq valide.")
+        self._keys = deduped
+        self._clients = [Groq(api_key=k) for k in self._keys]
+        self._order: deque[int] = deque(range(len(self._clients)))
+
+    @property
+    def size(self) -> int:
+        return len(self._clients)
+
+    @property
+    def current_index(self) -> int:
+        return self._order[0]
+
+    @property
+    def current_client(self) -> Groq:
+        return self._clients[self.current_index]
+
+    @property
+    def current_key_masked(self) -> str:
+        return mask_api_key(self._keys[self.current_index])
+
+    def rotate(self) -> None:
+        self._order.rotate(-1)
+
+
+def load_groq_api_keys() -> list[str]:
+    """Charge GROQ_API_KEY1, GROQ_API_KEY2, GROQ_API_KEY3 depuis processing/.env."""
+    keys: list[str] = []
+    for env_name in GROQ_API_KEY_ENVS:
+        value = os.getenv(env_name, "").strip()
+        if value:
+            keys.append(value)
+    return list(dict.fromkeys(keys))
 
 
 def setup_logger(log_path: Path) -> logging.Logger:
@@ -331,15 +375,20 @@ def normalize_stroke_code(stroke: str | None) -> str | None:
     return STROKE_ALIASES.get(key, key or None)
 
 
-def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, int]:
+def call_groq_chunk(
+    client_pool: GroqClientPool,
+    chunk: str,
+    chunk_label: str,
+) -> tuple[str, int]:
     current_text = chunk
 
     for attempt in range(1, NETWORK_MAX_RETRIES + 1):
+        client = client_pool.current_client
         try:
             if DEBUG:
                 print(
                     f"  [debug] {chunk_label} tentative {attempt} "
-                    f"({len(current_text)} chars)..."
+                    f"({len(current_text)} chars) clé {client_pool.current_key_masked}..."
                 )
 
             t0 = time.perf_counter()
@@ -369,6 +418,15 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
             return text_out, total_tokens
 
         except RateLimitError as exc:
+            if client_pool.size > 1:
+                previous = client_pool.current_key_masked
+                client_pool.rotate()
+                print(
+                    f"  [429 RPM] {chunk_label} clé {previous} limitée "
+                    f"→ bascule vers {client_pool.current_key_masked}"
+                )
+                continue
+
             retry_after = RATE_LIMIT_SLEEP
             response = getattr(exc, "response", None)
             if response is not None:
@@ -386,6 +444,15 @@ def call_groq_chunk(client: Groq, chunk: str, chunk_label: str) -> tuple[str, in
         except APIStatusError as exc:
             code = exc.status_code
             message = str(exc).lower()
+
+            if code == 429 and client_pool.size > 1:
+                previous = client_pool.current_key_masked
+                client_pool.rotate()
+                print(
+                    f"  [429 API] {chunk_label} clé {previous} limitée "
+                    f"→ bascule vers {client_pool.current_key_masked}"
+                )
+                continue
 
             if code in (400, 401, 403):
                 if (
@@ -587,7 +654,11 @@ def normalize_output(raw: Any) -> dict[str, Any]:
     }
 
 
-def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[str, int, int]:
+def process_file(
+    file_path: Path,
+    client_pool: GroqClientPool,
+    requests_today: int,
+) -> tuple[str, int, int]:
     try:
         payload = json.loads(file_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -627,8 +698,10 @@ def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[st
             time.sleep(INTER_REQUEST_SLEEP)
 
         try:
-            raw_response, used_tokens = call_groq_chunk(client, chunk, label)
+            raw_response, used_tokens = call_groq_chunk(client_pool, chunk, label)
             nb_requests += 1
+            if client_pool.size > 1:
+                client_pool.rotate()
         except FatalGroqError:
             raise
         except RuntimeError as exc:
@@ -677,6 +750,24 @@ def process_file(file_path: Path, client: Groq, requests_today: int) -> tuple[st
     return "OK", total_tokens, nb_requests
 
 
+def process_file_with_pool(
+    file_path: Path,
+    api_keys: list[str],
+    requests_today: int,
+) -> tuple[str, str, int, int]:
+    """
+    Traite un fichier en bouclant sur les clés Groq du pool.
+    Retourne (file_name, status, tokens_utilisés, nb_requêtes_effectuées).
+    """
+    client_pool = GroqClientPool(api_keys)
+    status, used_tokens, nb_req = process_file(
+        file_path=file_path,
+        client_pool=client_pool,
+        requests_today=requests_today,
+    )
+    return file_path.name, status, used_tokens, nb_req
+
+
 def resolve_input_file(name_or_path: str) -> Path:
     candidate = Path(name_or_path).expanduser()
     if candidate.is_file():
@@ -702,11 +793,18 @@ def main() -> int:
         metavar="NOM_OU_CHEMIN",
         help="Traiter un seul fichier (nom dans le dossier 2016 ou chemin).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Nombre de workers parallèles (0 = auto = nb de clés API).",
+    )
     args = parser.parse_args()
 
-    api_key = get_groq_api_key()
-    if not api_key:
-        print(f"[erreur] {GROQ_API_KEY_ENV} manquante dans processing/.env")
+    api_keys = load_groq_api_keys()
+    if not api_keys:
+        print("[erreur] Aucune clé Groq trouvée.")
+        print("         Définis GROQ_API_KEY1, GROQ_API_KEY2 et GROQ_API_KEY3 dans processing/.env")
         return 1
 
     if not INPUT_DIR.is_dir():
@@ -714,7 +812,7 @@ def main() -> int:
         return 1
 
     logger = setup_logger(LOG_FILE)
-    client = Groq(api_key=api_key)
+    client_pool = GroqClientPool(api_keys)
 
     single_file = bool(args.file)
     update_progress = not single_file
@@ -773,6 +871,8 @@ def main() -> int:
 
     print("=" * 60)
     print(f"  Modèle               : {MODEL}")
+    print(f"  Clés Groq actives    : {client_pool.size} ({', '.join(mask_api_key(k) for k in api_keys)})")
+    print(f"  Clé courante         : {client_pool.current_key_masked}")
     print(f"  Source               : {INPUT_DIR}")
     print(f"  Sortie               : {OUTPUT_DIR}")
     print(f"  Fichiers restants    : {len(pending)}")
@@ -784,25 +884,16 @@ def main() -> int:
     ok_count = 0
     err_count = 0
 
-    for index, file_path in enumerate(pending, start=1):
-        if requests_today >= DAILY_REQUEST_THRESHOLD:
-            print(f"\n[stop] Quota journalier atteint ({requests_today} requêtes).")
-            break
-
-        print(f"\n[{index}/{len(pending)}] {file_path.name}")
-
-        if index > 1:
-            print(f"  [attente {INTER_REQUEST_SLEEP:.0f}s] entre fichiers...")
-            time.sleep(INTER_REQUEST_SLEEP)
-
+    if single_file:
+        file_path = pending[0]
+        print(f"\n[1/1] {file_path.name}")
         status = "ERREUR"
         used_tokens = 0
         nb_req = 0
-
         try:
             status, used_tokens, nb_req = process_file(
                 file_path=file_path,
-                client=client,
+                client_pool=client_pool,
                 requests_today=requests_today,
             )
         except FatalGroqError as exc:
@@ -822,9 +913,6 @@ def main() -> int:
             ok_count += 1
             out_path = OUTPUT_DIR / file_path.name
             print(f"  ✓ OK | {used_tokens} tokens | écrit : {out_path}")
-            if update_progress:
-                processed.add(file_path.name)
-                progress["processed_files"] = sorted(processed)
             logger.info(
                 "%s | OK | tokens=%d | req_total=%d",
                 file_path.name,
@@ -835,9 +923,82 @@ def main() -> int:
             err_count += 1
             logger.error("%s | ERREUR | %s", file_path.name, status)
             print(f"  ✗ ERREUR : {status}")
+    else:
+        max_workers = args.workers if args.workers and args.workers > 0 else client_pool.size
+        max_workers = max(1, min(max_workers, client_pool.size, len(pending)))
+        print(
+            f"[info] Traitement parallèle : {max_workers} worker(s), "
+            f"rotation sur {client_pool.size} clé(s)."
+        )
 
-        if update_progress:
-            save_progress(PROGRESS_FILE, progress)
+        future_to_file: dict[concurrent.futures.Future[tuple[str, str, int, int]], Path] = {}
+        next_idx = 0
+        completed = 0
+        stop_due_quota = False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            while next_idx < len(pending) and len(future_to_file) < max_workers:
+                file_path = pending[next_idx]
+                print(f"\n[{next_idx + 1}/{len(pending)}] {file_path.name} (démarré)")
+                future = executor.submit(process_file_with_pool, file_path, api_keys, requests_today)
+                future_to_file[future] = file_path
+                next_idx += 1
+
+            while future_to_file:
+                done, _ = concurrent.futures.wait(
+                    future_to_file.keys(),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    file_path = future_to_file.pop(fut)
+                    completed += 1
+                    status = "ERREUR"
+                    used_tokens = 0
+                    nb_req = 1
+                    try:
+                        _, status, used_tokens, nb_req = fut.result()
+                    except FatalGroqError as exc:
+                        logger.error("%s | FATAL | %s", file_path.name, exc)
+                        print(f"  FATAL [{completed}/{len(pending)}] {file_path.name} : {exc}")
+                        if update_progress:
+                            save_progress(PROGRESS_FILE, progress)
+                        return 1
+                    except Exception as exc:
+                        status = f"Exception : {exc}"
+
+                    requests_today += nb_req
+                    progress["requests_today"] = requests_today
+
+                    if status == "OK":
+                        ok_count += 1
+                        out_path = OUTPUT_DIR / file_path.name
+                        print(f"  ✓ [{completed}/{len(pending)}] {file_path.name} | {used_tokens} tokens | écrit : {out_path}")
+                        processed.add(file_path.name)
+                        progress["processed_files"] = sorted(processed)
+                        logger.info(
+                            "%s | OK | tokens=%d | req_total=%d",
+                            file_path.name,
+                            used_tokens,
+                            requests_today,
+                        )
+                    else:
+                        err_count += 1
+                        logger.error("%s | ERREUR | %s", file_path.name, status)
+                        print(f"  ✗ [{completed}/{len(pending)}] {file_path.name} | ERREUR : {status}")
+
+                    save_progress(PROGRESS_FILE, progress)
+
+                    if requests_today >= DAILY_REQUEST_THRESHOLD:
+                        print(f"\n[stop] Quota journalier atteint ({requests_today} requêtes).")
+                        stop_due_quota = True
+                        continue
+
+                    if not stop_due_quota and next_idx < len(pending):
+                        file_path = pending[next_idx]
+                        print(f"\n[{next_idx + 1}/{len(pending)}] {file_path.name} (démarré)")
+                        future = executor.submit(process_file_with_pool, file_path, api_keys, requests_today)
+                        future_to_file[future] = file_path
+                        next_idx += 1
 
     print("\n" + "=" * 60)
     print(f"  ✓ Succès  : {ok_count}")
